@@ -1,0 +1,23 @@
+{
+  "name": "univ3-rebalance-bot",
+  "version": "0.1.0",
+  "description": "Minimal Uniswap V3 liquidity rebalancing bot on Base",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "vitest run tests/integration.fork.test.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}
