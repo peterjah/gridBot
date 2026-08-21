@@ -63,13 +63,16 @@ export class Monitor {
 
   async cycle(): Promise<void> {
     const state = await getPoolState(this.client, this.pool.address);
-    const position = await getPosition(
-      this.client,
-      this.config.positionManagerAddress,
-      this.config.positionId,
-    );
+    const position =
+      this.config.positionId === 0n
+        ? null
+        : await getPosition(
+            this.client,
+            this.config.positionManagerAddress,
+            this.config.positionId,
+          );
 
-    if (!position) {
+    if (this.config.positionId !== 0n && !position) {
       logger.error("Position does not exist", { positionId: this.config.positionId.toString() });
       return;
     }
@@ -79,12 +82,16 @@ export class Monitor {
       this.pool.token0.decimals,
       this.pool.token1.decimals,
     );
-    const center = Math.floor((position.tickLower + position.tickUpper) / 2);
+    const center = position
+      ? Math.floor((position.tickLower + position.tickUpper) / 2)
+      : state.currentTick;
     const distance = Math.abs(state.currentTick - center);
 
     // An empty position (liquidity == 0) always needs rebuilding; this is the
     // recovery path if a previous rebalance failed midway.
+    // When there is no position yet, we always mint from wallet balances.
     const decision =
+      !position ||
       position.liquidity === 0n ||
       this.strategy.shouldRebalance(state.currentTick, {
         lowerTick: position.tickLower,
@@ -94,23 +101,36 @@ export class Monitor {
     logger.info("Monitor cycle", {
       price,
       currentTick: state.currentTick,
-      positionLowerTick: position.tickLower,
-      positionUpperTick: position.tickUpper,
+      positionLowerTick: position?.tickLower ?? null,
+      positionUpperTick: position?.tickUpper ?? null,
       positionCenterTick: center,
       distanceFromCenter: distance,
-      liquidity: position.liquidity.toString(),
+      liquidity: position?.liquidity.toString() ?? "0",
       rebalanceDecision: decision ? "REBALANCE" : "HOLD",
       dryRun: this.config.dryRun,
     });
 
     if (!decision) return;
 
-    if (position.liquidity === 0n && (await this.walletIsEmpty())) {
-      logger.warn("Position is closed and wallet holds no funds; nothing to do");
+    if ((!position || position.liquidity === 0n) && (await this.walletIsEmpty())) {
+      logger.warn("No position and wallet holds no funds; nothing to do");
       return;
     }
 
-    await this.executor.rebalance(position, state.sqrtPriceX96, state.currentTick);
+    const wallet = this.config.walletAddress ?? this.transactor.account.address;
+    const rebalancePosition = position ?? {
+      tokenId: 0n,
+      owner: wallet,
+      token0: this.pool.token0.address,
+      token1: this.pool.token1.address,
+      fee: this.pool.fee,
+      tickLower: 0,
+      tickUpper: 0,
+      liquidity: 0n,
+      tokensOwed0: 0n,
+      tokensOwed1: 0n,
+    };
+    await this.executor.rebalance(rebalancePosition, state.sqrtPriceX96, state.currentTick);
   }
 
   private async walletIsEmpty(): Promise<boolean> {

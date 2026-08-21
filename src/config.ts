@@ -63,7 +63,9 @@ export function loadConfig(): Config {
       ? (process.env.WALLET_ADDRESS.toLowerCase() as `0x${string}`)
       : undefined,
     poolAddress: requireEnv("POOL_ADDRESS").toLowerCase() as `0x${string}`,
-    positionId: BigInt(requireIntEnv("POSITION_ID")),
+    positionId: process.env.POSITION_ID
+      ? BigInt(requireIntEnv("POSITION_ID"))
+      : 0n,
     rangeWidthTicks: requireIntEnv("RANGE_WIDTH_TICKS"),
     rebalanceThresholdTicks: requireIntEnv("REBALANCE_THRESHOLD_TICKS"),
     slippageBps,

@@ -83,7 +83,7 @@ export class RebalanceExecutor {
     const swapPlan = planBalancingSwap(required0, required1, balance0Before, balance1Before);
 
     logger.info("Rebalance plan", {
-      oldPositionId: position.tokenId.toString(),
+      oldPositionId: position.tokenId === 0n ? null : position.tokenId.toString(),
       oldRange: { lowerTick: position.tickLower, upperTick: position.tickUpper },
       newLowerTick: range.lowerTick,
       newUpperTick: range.upperTick,
@@ -101,8 +101,8 @@ export class RebalanceExecutor {
       }
       logger.info("[DRY RUN] Would perform", {
         steps: [
-          ...(position.liquidity > 0n ? ["decreaseLiquidity"] : []),
-          "collect",
+          ...(position.tokenId !== 0n && position.liquidity > 0n ? ["decreaseLiquidity"] : []),
+          ...(position.tokenId !== 0n ? ["collect"] : []),
           ...(swapPlan ? ["exactInputSingle"] : []),
           "mint",
         ],
@@ -117,10 +117,12 @@ export class RebalanceExecutor {
     }
 
     // ---- Execution phase (chain state is the source of truth) --------------
-    if (position.liquidity > 0n) {
-      await this.decreaseLiquidity(position);
+    if (position.tokenId !== 0n) {
+      if (position.liquidity > 0n) {
+        await this.decreaseLiquidity(position);
+      }
+      await this.collect(position);
     }
-    await this.collect(position);
 
     let [balance0, balance1] = await this.getBalances();
     logger.info("Balances after closing position", {
