@@ -3,38 +3,7 @@ import { encodeFunctionData } from "viem";
 import type { BotClient } from "../blockchain/client.js";
 import { quoterV2Abi, swapRouter02Abi } from "./abis.js";
 
-export interface SwapPlan {
-  zeroForOne: boolean;
-  amountIn: bigint;
-}
-
-/**
- * Pure calculation of which token must be swapped (if any) to approximately
- * reach the required token0/token1 ratio, given wallet balances.
- *
- * Returns null when no swap is needed.
- */
-export function planBalancingSwap(
-  required0: bigint,
-  required1: bigint,
-  balance0: bigint,
-  balance1: bigint,
-): SwapPlan | null {
-  const excess0 = balance0 > required0 ? balance0 - required0 : 0n;
-  const deficit1 = required1 > balance1 ? required1 - balance1 : 0n;
-  const excess1 = balance1 > required1 ? balance1 - required1 : 0n;
-  const deficit0 = required0 > balance0 ? required0 - balance0 : 0n;
-
-  if (excess0 > 0n && deficit1 > 0n) {
-    return { zeroForOne: true, amountIn: excess0 };
-  }
-  if (excess1 > 0n && deficit0 > 0n) {
-    return { zeroForOne: false, amountIn: excess1 };
-  }
-  return null;
-}
-
-/** Quote an exact-input single-hop swap via QuoterV2. */
+/** Quote an exact-input single-hop swap via QuoterV2 (read-only). */
 export async function quoteExactInputSingle(
   client: BotClient,
   quoter: Address,

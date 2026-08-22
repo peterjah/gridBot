@@ -1,48 +1,47 @@
-import { loadConfig } from "./config.js";
-import { createClient } from "./blockchain/client.js";
-import { createTransactor } from "./blockchain/wallet.js";
-import { getPoolInfo } from "./uniswap/pool.js";
-import { CenteredRangeStrategy } from "./strategy/centeredRange.js";
-import { Monitor } from "./bot/monitor.js";
-import { ensureStateDir, loadPositionId } from "./bot/state.js";
-import { logger } from "./utils/logger.js";
+import type { Mode } from "./config.js";
+import { MODES, loadConfig } from "./config.js";
+import { applyArgOverrides, parseArgs } from "./cli.js";
+import { runBacktestMode } from "./runners/backtest.js";
+import { runOptimizeMode } from "./runners/optimize.js";
+import { runWalkForwardMode } from "./runners/walkForward.js";
+import { runCompareMode } from "./runners/compare.js";
+import { runScenarioMode } from "./runners/scenario.js";
+import { runPaperMode } from "./runners/paper.js";
+import { runLiveMode } from "./runners/live.js";
 
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const client = createClient(config.rpcUrls);
-  const transactor = createTransactor(config.privateKey, config.rpcUrls);
+  const args = parseArgs(process.argv.slice(2));
 
-  // The state file tracks the position id across restarts and rebalances;
-  // it takes precedence over POSITION_ID when present.
-  ensureStateDir(config.stateFile);
-  const statePositionId = loadPositionId(config.stateFile);
-  if (statePositionId !== null) {
-    logger.info("Resuming managed position from state file", {
-      positionId: statePositionId.toString(),
-      stateFile: config.stateFile,
-    });
-    config.positionId = statePositionId;
+  const modeArg = (args["mode"] ?? undefined) as Mode | undefined;
+  const envMode = (process.env.MODE ?? "") as Mode;
+  const mode: Mode =
+    modeArg ?? ((MODES as string[]).includes(envMode) ? envMode : "backtest");
+  if (!(MODES as string[]).includes(mode)) {
+    throw new Error(`Unknown mode "${mode}". Expected one of: ${MODES.join(", ")}`);
   }
 
-  logger.info("Connecting to pool", { pool: config.poolAddress });
-  const pool = await getPoolInfo(client, config.poolAddress);
-  logger.info("Pool metadata read from chain", {
-    token0: `${pool.token0.symbol} (${pool.token0.address}, ${pool.token0.decimals} decimals)`,
-    token1: `${pool.token1.symbol} (${pool.token1.address}, ${pool.token1.decimals} decimals)`,
-    fee: pool.fee,
-    tickSpacing: pool.tickSpacing,
-  });
+  const cfg = loadConfig(mode);
+  applyArgOverrides(cfg, args);
 
-  const strategy = new CenteredRangeStrategy({
-    widthTicks: config.rangeWidthTicks,
-    thresholdTicks: config.rebalanceThresholdTicks,
-  });
-
-  const monitor = new Monitor(client, transactor, config, pool, strategy);
-  await monitor.run();
+  switch (mode) {
+    case "backtest":
+      return runBacktestMode(cfg);
+    case "optimize":
+      return runOptimizeMode(cfg);
+    case "walk-forward":
+      return runWalkForwardMode(cfg);
+    case "compare":
+      return runCompareMode(cfg);
+    case "scenario":
+      return runScenarioMode(cfg);
+    case "paper":
+      return runPaperMode(cfg);
+    case "live":
+      return runLiveMode(cfg);
+  }
 }
 
 main().catch((error) => {
-  logger.error("Fatal error", { error: error instanceof Error ? error.message : String(error) });
+  console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 });

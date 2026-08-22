@@ -4,10 +4,18 @@
   "description": "Minimal Uniswap V3 liquidity rebalancing bot on Base",
   "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts",
+    "backtest": "MODE=backtest tsx src/index.ts",
+    "optimize": "MODE=optimize tsx src/index.ts",
+    "scenario": "MODE=scenario tsx src/index.ts",
+    "walk-forward": "MODE=walk-forward tsx src/index.ts",
+    "compare": "MODE=compare tsx src/index.ts",
+    "paper": "MODE=paper tsx src/index.ts",
+    "live": "MODE=live tsx src/index.ts",
+    "fetch-data": "tsx scripts/fetchPrices.ts",
+    "fetch-apr": "tsx scripts/fetchPoolApr.ts",
+    "generate-data": "tsx scripts/generateSampleData.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:integration": "vitest run tests/integration.fork.test.ts"
+    "test": "vitest run"
   },
   "license": "MIT",
   "dependencies": {
