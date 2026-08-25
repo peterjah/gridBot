@@ -24,19 +24,28 @@ export interface PoolState {
 
 /** Read immutable pool + token metadata. Token ordering is read from the contract. */
 export async function getPoolInfo(client: BotClient, poolAddress: Address): Promise<PoolInfo> {
-  const [token0, token1, fee, tickSpacing] = await Promise.all([
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "token0" }),
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "token1" }),
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "fee" }),
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "tickSpacing" }),
-  ]);
+  // Two multicalls rather than eight round trips: the token addresses have to
+  // come back before their metadata can be requested, so this cannot collapse
+  // any further.
+  const [token0, token1, fee, tickSpacing] = await client.multicall({
+    allowFailure: false,
+    contracts: [
+      { address: poolAddress, abi: poolAbi, functionName: "token0" },
+      { address: poolAddress, abi: poolAbi, functionName: "token1" },
+      { address: poolAddress, abi: poolAbi, functionName: "fee" },
+      { address: poolAddress, abi: poolAbi, functionName: "tickSpacing" },
+    ],
+  });
 
-  const [symbol0, decimals0, symbol1, decimals1] = await Promise.all([
-    client.readContract({ address: token0, abi: erc20Abi, functionName: "symbol" }),
-    client.readContract({ address: token0, abi: erc20Abi, functionName: "decimals" }),
-    client.readContract({ address: token1, abi: erc20Abi, functionName: "symbol" }),
-    client.readContract({ address: token1, abi: erc20Abi, functionName: "decimals" }),
-  ]);
+  const [symbol0, decimals0, symbol1, decimals1] = await client.multicall({
+    allowFailure: false,
+    contracts: [
+      { address: token0, abi: erc20Abi, functionName: "symbol" },
+      { address: token0, abi: erc20Abi, functionName: "decimals" },
+      { address: token1, abi: erc20Abi, functionName: "symbol" },
+      { address: token1, abi: erc20Abi, functionName: "decimals" },
+    ],
+  });
 
   return {
     address: poolAddress,
@@ -49,10 +58,16 @@ export async function getPoolInfo(client: BotClient, poolAddress: Address): Prom
 
 /** Read mutable pool state. */
 export async function getPoolState(client: BotClient, poolAddress: Address): Promise<PoolState> {
-  const [slot0, liquidity] = await Promise.all([
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "slot0" }),
-    client.readContract({ address: poolAddress, abi: poolAbi, functionName: "liquidity" }),
-  ]);
+  // One request per poll instead of two — and, unlike Promise.all, both values
+  // are guaranteed to come from the SAME block, so price and liquidity cannot
+  // disagree about which state they describe.
+  const [slot0, liquidity] = await client.multicall({
+    allowFailure: false,
+    contracts: [
+      { address: poolAddress, abi: poolAbi, functionName: "slot0" },
+      { address: poolAddress, abi: poolAbi, functionName: "liquidity" },
+    ],
+  });
   return {
     sqrtPriceX96: slot0[0],
     currentTick: Number(slot0[1]),

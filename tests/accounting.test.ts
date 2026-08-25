@@ -14,6 +14,7 @@ function makeConfig(overrides: Partial<GridConfig> = {}): GridConfig {
     levelsAbove: 5,
     levelsBelow: 5,
     orderSizeUsd: 1000,
+    executionMode: "taker",
     feeBps: 5,
     slippageBps: 3,
     minEthUsd: 0,
@@ -25,11 +26,17 @@ function makeConfig(overrides: Partial<GridConfig> = {}): GridConfig {
     lpVenueVolumeSharePct: 5,
     lpPoolLiquidityUsd: 0,
     lpFeeAprPct: 0,
+    lpReferenceRangePct: 0,
     regimeMaxMovePct: 0,
     regimeLookbackPoints: 336,
     regenMinSeconds: 3600,
     volLookbackPoints: 24,
     maxVolPerStep: 0.005,
+    resetConfirmObservations: 0,
+    resetVolPostpone: false,
+    resetHardDrawdownPct: 25,
+    resetHardInventoryLossPct: 0,
+    resetSkipCooldownWhenFlat: false,
     resetBreakerK: 3,
     resetBreakerWindowSeconds: 30 * 24 * 3600,
     ...overrides,
@@ -86,8 +93,26 @@ describe("accounting reconciliation", () => {
   });
 
   it("reconciles with resets disabled", () => {
-    const result = run(walk(1500, 4000, -0.001), { resetBufferLevels: 0 });
+    // Both triggers off: band exits AND the drawdown backstop, which fires
+    // independently of resetBufferLevels.
+    const result = run(walk(1500, 4000, -0.001), {
+      resetBufferLevels: 0,
+      resetHardDrawdownPct: 0,
+    });
     expect(result.resets).toHaveLength(0);
+    expect(() => assertAccountingReconciles(result)).not.toThrow();
+  });
+
+  it("fires the drawdown backstop even when re-centring is disabled", () => {
+    // A backstop that only works when a reset was already going to happen is
+    // not a backstop. resetBufferLevels = 0 disables re-centring; the
+    // circuit breaker must still protect the book.
+    const result = run(walk(1500, 4000, -0.001), {
+      resetBufferLevels: 0,
+      resetHardDrawdownPct: 25,
+    });
+    expect(result.resets.length).toBeGreaterThan(0);
+    expect(result.resets.every((r) => r.reason === "INVENTORY_LIMIT")).toBe(true);
     expect(() => assertAccountingReconciles(result)).not.toThrow();
   });
 
@@ -156,7 +181,9 @@ describe("P&L sources stay distinct", () => {
   it("records the cost basis and reason of every reset", () => {
     const result = run(walk(2000, 4000, -0.0015));
     for (const r of result.resets) {
-      expect(r.reason).toBe("PRICE_OUTSIDE_GRID");
+      // Band exits report PRICE_OUTSIDE_GRID; the drawdown backstop reports
+      // INVENTORY_LIMIT, and both can occur in one run.
+      expect(["PRICE_OUTSIDE_GRID", "INVENTORY_LIMIT"]).toContain(r.reason);
       expect(r.id).toBeGreaterThan(0);
       expect(r.oldBounds.lower).toBeLessThan(r.oldBounds.upper);
       if (r.ethInventoryBefore > 0) {
@@ -274,7 +301,8 @@ describe("reset liquidation policy", () => {
     // a carry policy relabels reset P&L as grid P&L instead of avoiding it.
     const data = walk(2000, 4000, -0.0015);
     const dumped = run(data, { maxVolPerStep: 1 });
-    const carried = run(data, { maxVolPerStep: 1, resetSellFraction: 0 });
+    // Backstop disabled: this test isolates carry accounting semantics.
+    const carried = run(data, { maxVolPerStep: 1, resetSellFraction: 0, resetHardDrawdownPct: 0 });
     expect(carried.resetPnlUsd).toBe(0);
     expect(carried.gridPnlUsd).toBeLessThan(dumped.gridPnlUsd);
     // And it raises exposure, which is the risk the reset exists to bound.
@@ -282,6 +310,35 @@ describe("reset liquidation policy", () => {
     // downtrend, so the discriminating measure is the average.
     expect(carried.inventory.avgEthExposurePct).toBeGreaterThan(
       dumped.inventory.avgEthExposurePct,
+    );
+  });
+  it("hard-drawdown backstop force-liquidates a carried position", () => {
+    // Carry everything (fraction 0) with underwater-skip; the backstop must
+    // still cap the damage in a deep trend.
+    const data = walk(2000, 4000, -0.0015);
+    const withoutBackstop = run(data, {
+      maxVolPerStep: 1,
+      resetSellFraction: 0,
+      resetHardDrawdownPct: 0,
+      resetUnderwaterSkipPct: 50,
+    });
+    const withBackstop = run(data, {
+      maxVolPerStep: 1,
+      resetSellFraction: 0,
+      resetHardDrawdownPct: 25,
+      resetUnderwaterSkipPct: 50,
+    });
+    expect(withoutBackstop.resetPnlUsd).toBe(0);
+    expect(withBackstop.resetPnlUsd).toBeLessThan(0); // forced liquidations happened
+    // The backstop trades realized losses for lower exposure: in a deep
+    // trend it bounds PER-POSITION loss, so total drawdown shrinks and more
+    // capital survives.
+    expect(withBackstop.maxDrawdownPct).toBeGreaterThan(withoutBackstop.maxDrawdownPct);
+    expect(withBackstop.finalPortfolioValue).toBeGreaterThan(
+      withoutBackstop.finalPortfolioValue,
+    );
+    expect(withBackstop.inventory.avgEthExposurePct).toBeLessThan(
+      withoutBackstop.inventory.avgEthExposurePct,
     );
   });
 });
@@ -298,7 +355,8 @@ describe("LP fee income", () => {
 
   it("earns nothing when capture is zero (the default)", () => {
     const data = flatWithVolume(100, 1_000_000);
-    const cfg = makeConfig({ centerPrice: 4000 });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000 });
     const s = new GridStrategy(cfg, new LinearCostFillModel(5, 3));
     const result = runBacktest(s, data, 0.02);
     expect(result.feeIncomeUsd).toBe(0);
@@ -308,6 +366,7 @@ describe("LP fee income", () => {
   it("accrues a pro-rata share of the pool's fees while in range", () => {
     const data = flatWithVolume(100, 1_000_000);
     const cfg = makeConfig({
+      executionMode: "lp",
       centerPrice: 4000,
       lpFeeBps: 5,
       lpVenueVolumeSharePct: 10,
@@ -330,6 +389,7 @@ describe("LP fee income", () => {
     const lp = { lpFeeBps: 5, lpVenueVolumeSharePct: 10, lpPoolLiquidityUsd: 1_000_000 };
     const income = (initialUsdc: number) => {
       const cfg = makeConfig({
+      executionMode: "lp",
         centerPrice: 4000,
         initialUsdc,
         orderSizeUsd: initialUsdc / 10,
@@ -350,6 +410,7 @@ describe("LP fee income", () => {
     const data = flatWithVolume(100, 1_000_000);
     const income = (pool: number) => {
       const cfg = makeConfig({
+      executionMode: "lp",
         centerPrice: 4000,
         lpFeeBps: 5,
         lpVenueVolumeSharePct: 10,
@@ -369,6 +430,7 @@ describe("LP fee income", () => {
       volumeUsd: 1_000_000,
     }));
     const cfg = makeConfig({
+      executionMode: "lp",
       centerPrice: 4000,
       lpVenueVolumeSharePct: 10,
       lpPoolLiquidityUsd: 100_000,
@@ -384,6 +446,7 @@ describe("LP fee income", () => {
       volumeUsd: 2_000_000 + i,
     }));
     const cfg = makeConfig({
+      executionMode: "lp",
       centerPrice: data[0]!.price,
       lpVenueVolumeSharePct: 10,
       lpPoolLiquidityUsd: 100_000,
@@ -458,7 +521,8 @@ describe("APR-calibrated fee income", () => {
 
   it("earns the configured APR, time-weighted", () => {
     // 100 hourly observations; the first is the init tick, so 99 hours accrue.
-    const cfg = makeConfig({ centerPrice: 4000, lpFeeAprPct: 50 });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, lpFeeAprPct: 50 });
     const result = runBacktest(
       new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
       flat(100),
@@ -480,7 +544,8 @@ describe("APR-calibrated fee income", () => {
         timestamp: T0 + i * stepHours * H,
         price: 4000,
       }));
-      const cfg = makeConfig({ centerPrice: 4000, lpFeeAprPct: 50 });
+      const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, lpFeeAprPct: 50 });
       return runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0)
         .feeIncomeUsd;
     };
@@ -488,7 +553,8 @@ describe("APR-calibrated fee income", () => {
   });
 
   it("prefers a per-observation APR over the configured constant", () => {
-    const cfg = makeConfig({ centerPrice: 4000, lpFeeAprPct: 10 });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, lpFeeAprPct: 10 });
     const result = runBacktest(
       new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
       flat(100, 100), // data says 100% APR, config says 10%
@@ -501,6 +567,7 @@ describe("APR-calibrated fee income", () => {
   it("dilutes a position that is large relative to the pool", () => {
     const income = (pool: number) => {
       const cfg = makeConfig({
+      executionMode: "lp",
         centerPrice: 4000,
         lpFeeAprPct: 50,
         lpPoolLiquidityUsd: pool,
@@ -516,7 +583,8 @@ describe("APR-calibrated fee income", () => {
 
   it("reconciles with APR-based income", () => {
     const data = walk(1500, 4000, -0.0008).map((p) => ({ ...p, feeAprPct: 60 }));
-    const cfg = makeConfig({ centerPrice: data[0]!.price, maxVolPerStep: 1 });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: data[0]!.price, maxVolPerStep: 1 });
     const result = runBacktest(
       new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
       data,
@@ -536,7 +604,8 @@ describe("pool dilution from the APR series", () => {
         feeAprPct: 50,
         poolTvlUsd,
       }));
-      const cfg = makeConfig({ centerPrice: 4000 });
+      const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000 });
       return runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0)
         .feeIncomeUsd;
     };
@@ -563,7 +632,8 @@ describe("fee income accrues only on deployed capital", () => {
     // orders of $100 must not earn what one committing 5 orders of $1,000
     // earns — the rest of the balance is in the wallet, not the pool.
     const income = (orderSizeUsd: number) => {
-      const cfg = makeConfig({ centerPrice: 4000, orderSizeUsd });
+      const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, orderSizeUsd });
       return runBacktest(
         new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
         flat(200, 50),
@@ -577,7 +647,8 @@ describe("fee income accrues only on deployed capital", () => {
 
   it("never credits more than the portfolio is worth", () => {
     // Order size far larger than the balance: committed capital is capped.
-    const cfg = makeConfig({ centerPrice: 4000, orderSizeUsd: 100_000 });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, orderSizeUsd: 100_000 });
     const result = runBacktest(
       new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
       flat(200, 100),
@@ -598,12 +669,233 @@ describe("fee income accrues only on deployed capital", () => {
         feeAprPct: 100,
       })),
     ];
-    const cfg = makeConfig({ centerPrice: 4000, regenMinSeconds: 10_000 * H });
+    const cfg = makeConfig({
+      executionMode: "lp", centerPrice: 4000, regenMinSeconds: 10_000 * H });
     const result = runBacktest(
       new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
       data,
       0,
     );
     expect(result.feeIncomeUsd).toBe(0);
+  });
+});
+
+describe("batched gas model", () => {
+  /** One observation that crosses several BUY levels at once. */
+  function bigDrop(): PricePoint[] {
+    return [
+      { timestamp: T0, price: 4000 },
+      { timestamp: T0 + H, price: 3800 }, // crosses levels -1..-5
+    ];
+  }
+
+  it("charges the flat model once per fill (unchanged default)", () => {
+    const cfg = makeConfig({ centerPrice: 4000, resetBufferLevels: 0 });
+    const result = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      bigDrop(),
+      0.02,
+    );
+    expect(result.buysExecuted).toBeGreaterThan(1);
+    expect(result.totalGasUsd).toBeCloseTo(result.buysExecuted * 0.02, 9);
+  });
+
+  it("pays the transaction overhead once for a batch, not once per fill", () => {
+    const cfg = makeConfig({ centerPrice: 4000, resetBufferLevels: 0 });
+    const result = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      bigDrop(),
+      { txOverheadUsd: 1.0, perFillUsd: 0.02, lendingLegUsd: 0 },
+    );
+    const fills = result.buysExecuted;
+    expect(fills).toBeGreaterThan(1);
+    // One overhead for the whole batch — not `fills` overheads.
+    expect(result.totalGasUsd).toBeCloseTo(1.0 + fills * 0.02, 9);
+  });
+
+  it("charges the money-market leg once per transaction", () => {
+    const cfg = makeConfig({ centerPrice: 4000, resetBufferLevels: 0 });
+    const withLending = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      bigDrop(),
+      { txOverheadUsd: 0.1, perFillUsd: 0.02, lendingLegUsd: 0.5 },
+      true,
+    );
+    const without = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      bigDrop(),
+      { txOverheadUsd: 0.1, perFillUsd: 0.02, lendingLegUsd: 0.5 },
+      false,
+    );
+    expect(withLending.totalGasUsd - without.totalGasUsd).toBeCloseTo(0.5, 9);
+  });
+
+  it("splits batched gas across the ledger so it still sums to the total", () => {
+    const cfg = makeConfig({ centerPrice: 4000, resetBufferLevels: 0 });
+    const result = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      bigDrop(),
+      { txOverheadUsd: 1.0, perFillUsd: 0.02, lendingLegUsd: 0.3 },
+      true,
+    );
+    const ledgerGas = result.strategy
+      .getState()
+      .trades.reduce((sum, t) => sum + t.gasUsd, 0);
+    expect(ledgerGas).toBeCloseTo(result.totalGasUsd, 9);
+    expect(() => assertAccountingReconciles(result)).not.toThrow();
+  });
+});
+
+describe("fee income and the volatility gate must agree", () => {
+  it("earns no quote-side fees while buys are gated", () => {
+    // A maker cannot collect fees on an order it would refuse to fill.
+    // Choppy prices keep the gate shut; with a flat book there is no
+    // inventory earning on the base side either, so income must be zero.
+    const data: PricePoint[] = [{ timestamp: T0, price: 4000, feeAprPct: 100 }];
+    let price = 4000;
+    for (let i = 1; i <= 300; i++) {
+      price *= i % 2 === 0 ? 0.97 : 1 / 0.97;
+      data.push({ timestamp: T0 + i * H, price, feeAprPct: 100 });
+    }
+    const cfg = makeConfig({
+      executionMode: "lp",
+      centerPrice: 4000,
+      spacingPercent: 20, // wide, so chop does not cross a level
+      maxVolPerStep: 0.0001, // gate permanently shut
+      volLookbackPoints: 4,
+      resetBufferLevels: 0,
+    });
+    const result = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      data,
+      0,
+    );
+    // No buys happened, so nothing earns on the base side, and the gate
+    // withdraws the quote side. The only income is the warm-up window before
+    // volatility can be estimated at all, where the gate defaults open
+    // exactly as `executeBuy` does — a handful of hours out of 300.
+    const fullyDeployedForOneRun = 5 * 1000 * 1.0 * ((300 * H) / (365 * 24 * H));
+    expect(result.feeIncomeUsd).toBeLessThan(fullyDeployedForOneRun * 0.03);
+    expect(result.feeIncomeUsd).toBeGreaterThan(0);
+  });
+
+  it("earns fees again once the gate reopens", () => {
+    const calm: PricePoint[] = Array.from({ length: 300 }, (_, i) => ({
+      timestamp: T0 + i * H,
+      price: 4000,
+      feeAprPct: 100,
+    }));
+    const cfg = makeConfig({
+      executionMode: "lp",
+      centerPrice: 4000,
+      maxVolPerStep: 1, // gate open
+      volLookbackPoints: 4,
+      resetBufferLevels: 0,
+    });
+    const result = runBacktest(
+      new GridStrategy(cfg, new LinearCostFillModel(5, 3)),
+      calm,
+      0,
+    );
+    expect(result.feeIncomeUsd).toBeGreaterThan(0);
+  });
+});
+
+describe("execution mode: taker vs lp", () => {
+  /** Oscillate across the centre so grid levels fill repeatedly. */
+  function oscillate(steps: number): PricePoint[] {
+    return Array.from({ length: steps }, (_, i) => ({
+      timestamp: T0 + i * H,
+      price: i % 2 === 0 ? 4000 : 3960,
+      feeAprPct: 50,
+      poolTvlUsd: 20_000_000,
+    }));
+  }
+
+  it("taker mode charges the pool fee on every grid fill", () => {
+    const cfg = makeConfig({ centerPrice: 4000, executionMode: "taker", resetBufferLevels: 0 });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), oscillate(60), 0.02);
+    expect(r.buysExecuted).toBeGreaterThan(0);
+    expect(r.totalFeeUsd).toBeGreaterThan(0);
+    expect(r.totalSlippageUsd).toBeGreaterThan(0);
+    expect(r.totalGasUsd).toBeGreaterThan(0);
+  });
+
+  it("lp mode charges nothing on a grid crossing", () => {
+    // The AMM converts deposited liquidity; the counterparty pays the fee.
+    const cfg = makeConfig({ centerPrice: 4000, executionMode: "lp", resetBufferLevels: 0 });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), oscillate(60), 0.02);
+    expect(r.buysExecuted).toBeGreaterThan(0);
+    expect(r.totalFeeUsd).toBe(0);
+    expect(r.totalSlippageUsd).toBe(0);
+    expect(r.totalGasUsd).toBe(0);
+  });
+
+  it("lp mode still charges re-centring, which is a real transaction", () => {
+    // Ramp out of the band so a reset fires: burn + swap + mint costs money.
+    const data: PricePoint[] = [];
+    let price = 4000;
+    for (let i = 0; i < 40; i++) {
+      data.push({ timestamp: T0 + i * H, price, feeAprPct: 50, poolTvlUsd: 20_000_000 });
+      price *= 1.01;
+    }
+    const cfg = makeConfig({
+      centerPrice: 4000,
+      executionMode: "lp",
+      initialEth: 2,
+      resetBufferLevels: 2,
+    });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0.02);
+    expect(r.resets.length).toBeGreaterThan(0);
+    // The liquidation swap is charged; the grid crossings before it are not.
+    expect(r.totalFeeUsd).toBeGreaterThan(0);
+    expect(r.totalGasUsd).toBeGreaterThan(0);
+    const liq = r.strategy.getState().trades.filter((t) => t.liquidation);
+    const gridT = r.strategy.getState().trades.filter((t) => !t.liquidation);
+    expect(liq.every((t) => t.gasUsd > 0)).toBe(true);
+    expect(gridT.every((t) => t.gasUsd === 0)).toBe(true);
+    expect(gridT.every((t) => t.feeUsd === 0)).toBe(true);
+  });
+
+  it("reconciles in lp mode", () => {
+    const data = walk(1500, 4000, -0.0008).map((p) => ({
+      ...p,
+      feeAprPct: 50,
+      poolTvlUsd: 20_000_000,
+    }));
+    const cfg = makeConfig({
+      centerPrice: data[0]!.price,
+      executionMode: "lp",
+      maxVolPerStep: 1,
+    });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0.02);
+    expect(() => assertAccountingReconciles(r)).not.toThrow();
+  });
+});
+
+describe("only deposited liquidity earns pool fees", () => {
+  it("taker mode earns no fee income even with an APR series loaded", () => {
+    const data: PricePoint[] = Array.from({ length: 200 }, (_, i) => ({
+      timestamp: T0 + i * H,
+      price: 4000,
+      feeAprPct: 100,
+      poolTvlUsd: 20_000_000,
+    }));
+    const cfg = makeConfig({ centerPrice: 4000, executionMode: "taker", resetBufferLevels: 0 });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0);
+    // It deposits nothing, so it earns nothing — it is the one paying the fee.
+    expect(r.feeIncomeUsd).toBe(0);
+  });
+
+  it("lp mode on the same data does earn", () => {
+    const data: PricePoint[] = Array.from({ length: 200 }, (_, i) => ({
+      timestamp: T0 + i * H,
+      price: 4000,
+      feeAprPct: 100,
+      poolTvlUsd: 20_000_000,
+    }));
+    const cfg = makeConfig({ centerPrice: 4000, executionMode: "lp", resetBufferLevels: 0 });
+    const r = runBacktest(new GridStrategy(cfg, new LinearCostFillModel(5, 3)), data, 0);
+    expect(r.feeIncomeUsd).toBeGreaterThan(0);
   });
 });

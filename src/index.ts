@@ -6,8 +6,11 @@ import { runOptimizeMode } from "./runners/optimize.js";
 import { runWalkForwardMode } from "./runners/walkForward.js";
 import { runCompareMode } from "./runners/compare.js";
 import { runScenarioMode } from "./runners/scenario.js";
+import { runLpMode } from "./runners/lp.js";
+import { runLpLiveMode } from "./runners/lpLive.js";
 import { runPaperMode } from "./runners/paper.js";
 import { runLiveMode } from "./runners/live.js";
+import { runSoakReport } from "./runners/soakReport.js";
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -34,10 +37,16 @@ async function main(): Promise<void> {
       return runCompareMode(cfg);
     case "scenario":
       return runScenarioMode(cfg);
+    case "lp":
+      return runLpMode(cfg);
+    case "lp-live":
+      return runLpLiveMode(cfg);
     case "paper":
       return runPaperMode(cfg);
     case "live":
       return runLiveMode(cfg);
+    case "soak-report":
+      return Promise.resolve(runSoakReport(cfg));
   }
 }
 

@@ -1,3 +1,5 @@
+import { concentrationMultiplier, feeShareOfPool } from "../lp/concentration.js";
+import { ZeroCostFillModel } from "./fillModel.js";
 import type {
   CenterChange,
   FillModel,
@@ -94,8 +96,24 @@ export class GridStrategy {
   private resetTimes: number[] = [];
   /** Rolling recent prices for the volatility estimate (oldest first). */
   private priceHistory: number[] = [];
+  /** Consecutive observations with price outside the reset band. */
+  private outsideCount = 0;
+  /** Highest portfolio value seen; anchor for the hard-drawdown backstop. */
+  private equityPeak = 0;
   /** Longer rolling window used by the causal regime filter. */
   private regimeHistory: number[] = [];
+  /**
+   * Memoized realized volatility for the current observation.
+   *
+   * The estimator walks the whole lookback window, and the window only
+   * changes when a new price arrives — but it is consulted several times per
+   * observation (the buy gate, the rebuild check, and twice more via
+   * deployedCapital/idleCapital while sampling). Recomputing it each time made
+   * the lookback length a multiplier on total runtime, which is what made
+   * 5-minute sweeps with a 288-bar window so slow.
+   */
+  private volCache: number | null = null;
+  private volCacheValid = false;
 
   private readonly trades: TradeRecord[] = [];
   private readonly skips: GridState["skips"] = [];
@@ -114,9 +132,18 @@ export class GridStrategy {
   /** Capital at the first observation; the reconciliation anchor. */
   private initialCapitalUsd = 0;
 
+  /**
+   * Fill model used for ordinary grid crossings. In "lp" mode these are AMM
+   * conversions of deposited liquidity, so they are cost-free; the supplied
+   * model is kept for re-centring swaps, which are real transactions.
+   */
+  private readonly gridFills: FillModel;
+
   constructor(config: GridConfig, fillModel: FillModel) {
     this.cfg = config;
     this.fills = fillModel;
+    this.gridFills =
+      config.executionMode === "lp" ? new ZeroCostFillModel() : fillModel;
     this.initialize();
   }
 
@@ -164,8 +191,12 @@ export class GridStrategy {
     this.cooldownStartedAt = null;
     this.resets = 0;
     this.resetTimes = [];
+    this.outsideCount = 0;
+    this.equityPeak = 0;
     this.priceHistory = [];
     this.regimeHistory = [];
+    this.volCache = null;
+    this.volCacheValid = false;
 
     this.center = this.cfg.centerPrice;
     this.buildLevels();
@@ -192,8 +223,14 @@ export class GridStrategy {
         this.lots.push({ eth: this.eth, costUsd: this.eth * price, seed: true });
       }
       this.initialCapitalUsd = this.usdc + this.eth * price;
+      this.equityPeak = Math.max(this.equityPeak, this.initialCapitalUsd);
       return [];
     }
+
+    // Equity peak anchors the hard-drawdown backstop; update on every
+    // observation including the first (peak is pre-crossing by one step,
+    // which is conservative for a drawdown stop).
+    this.equityPeak = Math.max(this.equityPeak, this.usdc + this.eth * price);
     const prev = this.lastPrice;
     const elapsedSeconds = Math.max(0, timestamp - this.lastTimestamp);
     this.lastPrice = price;
@@ -225,12 +262,37 @@ export class GridStrategy {
         }
       }
 
-      // Check whether price has left the grid band, or the regime filter has
-      // tripped; either flattens the book and starts a cooldown.
-      if (this.checkGridExit(price)) {
-        actions.push(...this.liquidate(price, timestamp, "PRICE_OUTSIDE_GRID"));
-      } else if (this.regimeHostile()) {
-        actions.push(...this.liquidate(price, timestamp, "REGIME_FILTER"));
+      // Circuit breaker FIRST, independent of every other trigger. Nested
+      // inside the band-exit check it was unreachable unless a reset was
+      // already going to happen, so it could not back-stop a collapse that
+      // stayed inside the band, nor a grid with resetBufferLevels = 0.
+      if (this.hardDrawdownBreached(price)) {
+        actions.push(...this.liquidate(price, timestamp, "INVENTORY_LIMIT", true));
+        this.outsideCount = 0;
+      } else if (this.checkGridExit(price)) {
+        this.outsideCount++;
+        // The confirmation guard exists to avoid liquidating inventory at a
+        // local extreme. With a flat book there is nothing to liquidate, so
+        // waiting protects nothing and only delays the re-centring — the same
+        // dead time the post-reset cooldown was costing.
+        const confirmed =
+          this.cfg.resetConfirmObservations === 0 ||
+          this.eth <= DUST_USD ||
+          this.outsideCount > this.cfg.resetConfirmObservations;
+        if (!confirmed) {
+          // Whipsaw filter: wait for more consecutive closes outside.
+        } else if (this.resetPostponedByVolatility()) {
+          // Sell in calmer conditions; stays pending via outsideCount.
+          this.skips.push({ side: "SELL", reason: "reset_postponed" });
+        } else {
+          actions.push(...this.liquidate(price, timestamp, "PRICE_OUTSIDE_GRID", false));
+          this.outsideCount = 0;
+        }
+      } else {
+        this.outsideCount = 0;
+        if (this.regimeHostile()) {
+          actions.push(...this.liquidate(price, timestamp, "REGIME_FILTER", false));
+        }
       }
     } else if (this.phase === "COOLDOWN") {
       const rebuilt = this.maybeRebuild(price, timestamp);
@@ -339,16 +401,110 @@ export class GridStrategy {
   }
 
   /**
+   * Full internal state as JSON. Two uses:
+   *  - live trading: snapshot before broadcasting a transaction, restore if
+   *    the transaction reverts (the strategy applies fills optimistically);
+   *  - restart recovery: persisted to disk each cycle and reloaded on boot.
+   */
+  serializeState(): string {
+    return JSON.stringify({
+      v: 1,
+      usdc: this.usdc,
+      eth: this.eth,
+      lastPrice: this.lastPrice,
+      lastTimestamp: this.lastTimestamp,
+      center: this.center,
+      levels: this.levels,
+      lots: this.lots,
+      phase: this.phase,
+      cooldownStartedAt: this.cooldownStartedAt,
+      resets: this.resets,
+      resetTimes: this.resetTimes,
+      priceHistory: this.priceHistory,
+      regimeHistory: this.regimeHistory,
+      outsideCount: this.outsideCount,
+      equityPeak: this.equityPeak,
+      trades: this.trades,
+      skips: this.skips,
+      resetRecords: this.resetRecords,
+      centerHistory: this.centerHistory,
+      seq: this.seq,
+      realizedGridGrossUsd: this.realizedGridGrossUsd,
+      realizedResetGrossUsd: this.realizedResetGrossUsd,
+      completedCycles: this.completedCycles,
+      totalFeeUsd: this.totalFeeUsd,
+      totalSlippageUsd: this.totalSlippageUsd,
+      feeIncomeUsd: this.feeIncomeUsd,
+      feeIncomeAtLastReset: this.feeIncomeAtLastReset,
+      externalDebitsUsd: this.externalDebitsUsd,
+      initialCapitalUsd: this.initialCapitalUsd,
+    });
+  }
+
+  /** Restore a snapshot produced by {@link serializeState}. Throws on version mismatch. */
+  restoreSerializedState(json: string): void {
+    const s = JSON.parse(json) as Record<string, unknown>;
+    if (s.v !== 1) throw new Error(`Unsupported strategy state version: ${String(s.v)}`);
+    this.usdc = s.usdc as number;
+    this.eth = s.eth as number;
+    this.lastPrice = (s.lastPrice ?? null) as number | null;
+    this.lastTimestamp = s.lastTimestamp as number;
+    this.center = s.center as number;
+    this.levels = s.levels as GridLevelState[];
+    this.lots = s.lots as Lot[];
+    this.phase = s.phase as Phase;
+    this.cooldownStartedAt = (s.cooldownStartedAt ?? null) as number | null;
+    this.resets = s.resets as number;
+    this.resetTimes = s.resetTimes as number[];
+    this.priceHistory = s.priceHistory as number[];
+    this.regimeHistory = s.regimeHistory as number[];
+    this.outsideCount = s.outsideCount as number;
+    this.equityPeak = s.equityPeak as number;
+
+    // readonly arrays are mutated in place.
+    this.trades.length = 0;
+    this.trades.push(...(s.trades as TradeRecord[]));
+    this.skips.length = 0;
+    this.skips.push(...(s.skips as GridState["skips"]));
+    this.resetRecords.length = 0;
+    this.resetRecords.push(...(s.resetRecords as ResetRecord[]));
+    this.centerHistory.length = 0;
+    this.centerHistory.push(...(s.centerHistory as CenterChange[]));
+
+    this.seq = s.seq as number;
+    this.realizedGridGrossUsd = s.realizedGridGrossUsd as number;
+    this.realizedResetGrossUsd = s.realizedResetGrossUsd as number;
+    this.completedCycles = s.completedCycles as number;
+    this.totalFeeUsd = s.totalFeeUsd as number;
+    this.totalSlippageUsd = s.totalSlippageUsd as number;
+    this.feeIncomeUsd = s.feeIncomeUsd as number;
+    this.feeIncomeAtLastReset = s.feeIncomeAtLastReset as number;
+    this.externalDebitsUsd = s.externalDebitsUsd as number;
+    this.initialCapitalUsd = s.initialCapitalUsd as number;
+  }
+
+  /**
    * Force a reset from outside the strategy (reason MANUAL). Present so the
    * reset data model is genuinely extensible; nothing calls it in the default
    * strategy path.
    */
   forceReset(price: number, timestamp: number, reason: ResetReason = "MANUAL"): StrategyAction[] {
     if (this.phase !== "ACTIVE") return [];
-    return this.liquidate(price, timestamp, reason);
+    return this.liquidate(price, timestamp, reason, false);
   }
 
   // ------------------------------------------------------------------ buys
+
+  /**
+   * True while the volatility gate is suppressing BUY fills.
+   *
+   * Shared with `deployedCapital` so the two cannot disagree: quote-side
+   * liquidity that would refuse a fill is not liquidity.
+   */
+  private buysGated(): boolean {
+    const vol = this.realizedVolatility();
+    return vol !== null && vol > this.cfg.maxVolPerStep;
+  }
 
   private executeBuy(
     level: GridLevelState,
@@ -357,8 +513,7 @@ export class GridStrategy {
   ): StrategyAction | null {
     // Volatility gate: stop accumulating into violent moves (the regimes
     // that tend to end in liquidations). Sells remain allowed to de-risk.
-    const vol = this.realizedVolatility();
-    if (vol !== null && vol > this.cfg.maxVolPerStep) {
+    if (this.buysGated()) {
       this.skips.push({ side: "BUY", reason: "high_vol" });
       return null;
     }
@@ -384,7 +539,7 @@ export class GridStrategy {
       return null;
     }
 
-    const fill = this.fills.quoteBuy(level.price, quote);
+    const fill = this.gridFills.quoteBuy(level.price, quote);
     this.usdc -= quote;
     this.eth += fill.ethOut;
     // Cost basis excludes the fee/slippage paid — those are counted once, in
@@ -467,7 +622,7 @@ export class GridStrategy {
       return null;
     }
 
-    const fill = this.fills.quoteSell(level.price, qty);
+    const fill = this.gridFills.quoteSell(level.price, qty);
     this.eth -= qty;
     this.usdc += fill.usdcOut;
     this.totalFeeUsd += fill.feeUsd;
@@ -543,6 +698,8 @@ export class GridStrategy {
   }
 
   private pushHistory(price: number): void {
+    // A new observation invalidates the memo.
+    this.volCacheValid = false;
     this.priceHistory.push(price);
     const maxLen = Math.max(this.cfg.volLookbackPoints + 1, 2);
     if (this.priceHistory.length > maxLen) {
@@ -585,17 +742,30 @@ export class GridStrategy {
    * Crediting fees on the whole portfolio instead would pay LP yield on idle
    * USDC, which makes tiny order sizes look free — the position would collect
    * the full pool rate while risking almost nothing.
+   *
+   * PUBLIC because it is also the definition of what is NOT idle: anything
+   * that wants to put spare balance to work (money-market lending, say) must
+   * use `idleCapital()` rather than re-deriving "idle", or the two notions
+   * will drift apart and capital will be double-counted as both lent and
+   * providing liquidity.
    */
-  private capitalAtWork(price: number): number {
+  deployedCapital(price: number): number {
     if (this.phase !== "ACTIVE") return 0;
     const { lower, upper } = this.bounds();
 
+    // While the volatility gate is suppressing buys, the quote side is NOT
+    // providing liquidity: a maker cannot collect fees on an order it would
+    // refuse to fill. Modelling it otherwise lets a configuration gate away
+    // essentially every buy and still bank the full fee income — which the
+    // optimizer will happily find and rank first.
     let quoteCommitted = 0;
-    for (const level of this.levels) {
-      // Only orders inside the band are providing liquidity at this price.
-      if (level.side !== "BUY") continue;
-      if (level.price < lower || level.price > upper) continue;
-      quoteCommitted += this.cfg.orderSizeUsd;
+    if (!this.buysGated()) {
+      for (const level of this.levels) {
+        // Only orders inside the band are providing liquidity at this price.
+        if (level.side !== "BUY") continue;
+        if (level.price < lower || level.price > upper) continue;
+        quoteCommitted += this.cfg.orderSizeUsd;
+      }
     }
 
     // Inventory is the base side of the position and is in range by
@@ -604,6 +774,18 @@ export class GridStrategy {
 
     // Cannot commit more than we hold.
     return Math.min(quoteCommitted + baseCommitted, this.usdc + this.eth * price);
+  }
+
+  /**
+   * USDC not committed to resting orders, in USD — the balance a money market
+   * could lend without touching the grid's working capital.
+   *
+   * Measured on the QUOTE side only: ETH inventory is the base side of the
+   * position and is not idle cash. Never negative.
+   */
+  idleCapital(price: number, deployed = this.deployedCapital(price)): number {
+    const deployedQuote = Math.max(0, deployed - this.eth * price);
+    return Math.max(0, this.usdc - deployedQuote);
   }
 
   /**
@@ -620,11 +802,15 @@ export class GridStrategy {
     market: { volumeUsd?: number; feeAprPct?: number; poolTvlUsd?: number },
     elapsedSeconds: number,
   ): void {
+    // Only deposited liquidity earns pool fees. A taker holds its balance in
+    // the wallet and market-swaps, so it has nothing in the pool to earn on —
+    // it is the one PAYING the fee, which the fill model already charges.
+    if (this.cfg.executionMode !== "lp") return;
     if (this.phase !== "ACTIVE") return;
     const { lower, upper } = this.bounds();
     if (price < lower || price > upper) return;
 
-    const myValue = this.capitalAtWork(price);
+    const myValue = this.deployedCapital(price);
     if (myValue <= 0) return;
 
     // Preferred path: a measured pool APR, either per-observation from the
@@ -633,14 +819,32 @@ export class GridStrategy {
     const apr = market.feeAprPct ?? this.cfg.lpFeeAprPct;
     if (apr > 0) {
       if (elapsedSeconds <= 0) return;
-      let income = myValue * (apr / 100) * (elapsedSeconds / SECONDS_PER_YEAR);
-      // Dilution: joining the pool adds liquidity, so the published
-      // pool-average rate is shared with our own capital. Prefer the pool's
-      // measured TVL at this observation; fall back to the configured depth.
-      // Without this a $10k position in an $11k pool would earn the full
-      // pool-average rate, which is not physical.
+      // The grid's band is its own outermost levels, so the same
+      // concentration adjustment applies as for any other V3 position.
+      const bandPct = ((upper - lower) / 2 / this.center) * 100;
+      const yearFrac = elapsedSeconds / SECONDS_PER_YEAR;
       const poolTvl = market.poolTvlUsd ?? this.cfg.lpPoolLiquidityUsd;
-      if (poolTvl > 0) income *= poolTvl / (myValue + poolTvl);
+      // With pool depth known, take a density-weighted share of the pool's
+      // fee revenue: concentration and dilution together, bounded by the
+      // pool's total fees. Otherwise fall back to the capped multiplier.
+      const useDensity = poolTvl > 0 && this.cfg.lpReferenceRangePct > 0;
+      let income: number;
+      if (useDensity) {
+        income =
+          poolTvl *
+          (apr / 100) *
+          yearFrac *
+          feeShareOfPool(myValue, bandPct, poolTvl, this.cfg.lpReferenceRangePct);
+      } else {
+        income =
+          myValue *
+          (apr / 100) *
+          yearFrac *
+          concentrationMultiplier(bandPct, this.cfg.lpReferenceRangePct);
+        // Concentration disabled: still dilute by pool depth so a position
+        // rivalling the pool does not earn the full published rate.
+        if (poolTvl > 0) income *= poolTvl / (myValue + poolTvl);
+      }
       this.feeIncomeUsd += income;
       this.usdc += income;
       return;
@@ -664,6 +868,48 @@ export class GridStrategy {
    * True when price has moved `resetBufferLevels` spacings beyond the
    * outermost level of the current grid.
    */
+  /** Drawdown from the equity peak at `price`, in percent (<= 0). */
+  private currentDrawdownPct(price: number): number {
+    if (this.equityPeak <= 0) return 0;
+    return ((this.usdc + this.eth * price) / this.equityPeak - 1) * 100;
+  }
+
+  /**
+   * How far the open inventory is underwater against its cost basis, in
+   * percent. 0 when flat. Negative means a loss.
+   *
+   * This is the at-risk slice. Portfolio drawdown dilutes it with cash and
+   * accumulated fees, which is why a portfolio-level backstop cannot fire for
+   * this strategy.
+   */
+  private inventoryLossPct(price: number): number {
+    if (this.eth <= DUST_USD) return 0;
+    const basis = this.costBasisUsd();
+    if (basis <= DUST_USD) return 0;
+    return ((this.eth * price) / basis - 1) * 100;
+  }
+
+  /** Backstop breached: force full liquidation regardless of other policies. */
+  private hardDrawdownBreached(price: number): boolean {
+    if (
+      this.cfg.resetHardDrawdownPct > 0 &&
+      this.currentDrawdownPct(price) <= -this.cfg.resetHardDrawdownPct
+    ) {
+      return true;
+    }
+    return (
+      this.cfg.resetHardInventoryLossPct > 0 &&
+      this.inventoryLossPct(price) <= -this.cfg.resetHardInventoryLossPct
+    );
+  }
+
+  /** True when the reset liquidation should wait for calmer markets. */
+  private resetPostponedByVolatility(): boolean {
+    if (!this.cfg.resetVolPostpone) return false;
+    const vol = this.realizedVolatility();
+    return vol !== null && vol > this.cfg.maxVolPerStep;
+  }
+
   private checkGridExit(price: number): boolean {
     if (this.cfg.resetBufferLevels <= 0 || this.levels.length === 0) return false;
     const step = 1 + this.cfg.spacingPercent / 100;
@@ -682,8 +928,12 @@ export class GridStrategy {
   private resetSellSize(
     price: number,
     avgCostPrice: number,
+    forced = false,
   ): { sellEth: number; carryReason: ResetRecord["carryReason"] } {
     if (this.eth <= 0) return { sellEth: 0, carryReason: null };
+
+    // The hard-drawdown backstop overrides everything: dump it all.
+    if (forced) return { sellEth: this.eth, carryReason: "HARD_STOP" };
 
     // Refusing to crystallize a deep loss takes priority over the fraction:
     // if we are this far underwater, carry the whole position.
@@ -709,7 +959,12 @@ export class GridStrategy {
    * exists (fields the environment owns — gas, drawdown, interval costs —
    * are filled by the backtester from the trade ledger).
    */
-  private liquidate(price: number, timestamp: number, reason: ResetReason): StrategyAction[] {
+  private liquidate(
+    price: number,
+    timestamp: number,
+    reason: ResetReason,
+    forced = false,
+  ): StrategyAction[] {
     const actions: StrategyAction[] = [];
 
     const id = this.resetRecords.length + 1;
@@ -722,7 +977,7 @@ export class GridStrategy {
     let usdcRecovered = 0;
     let realizedResetPnl = 0;
 
-    const { sellEth, carryReason } = this.resetSellSize(price, avgCostBefore);
+    const { sellEth, carryReason } = this.resetSellSize(price, avgCostBefore, forced);
 
     if (sellEth > DUST_USD) {
       const fill = this.fills.quoteSell(price, sellEth);
@@ -819,6 +1074,17 @@ export class GridStrategy {
    * liquidations mean the regime is hostile; wait progressively longer.
    */
   private maybeRebuild(price: number, timestamp: number): boolean {
+    // A reset that fired with a flat book sold nothing and de-risked nothing:
+    // it was a pure re-centring. Waiting afterwards protects no position and
+    // only costs time in the market, so the delay is optional for that case.
+    // Buys remain gated by realized volatility, which blocks accumulation
+    // into choppy markets — though not into a perfectly smooth trend, where
+    // the inventory ceiling is the relevant control.
+    if (!this.rebuildDelayApplies()) {
+      this.rebuildAt(price, timestamp);
+      return true;
+    }
+
     const required = this.requiredCooldownSeconds(timestamp);
     if (
       this.cooldownStartedAt !== null &&
@@ -831,6 +1097,27 @@ export class GridStrategy {
     // Do not restart into the move we just stood aside from.
     if (this.regimeHostile()) return false;
 
+    this.rebuildAt(price, timestamp);
+    return true;
+  }
+
+  /**
+   * True when the post-reset delay should be honoured.
+   *
+   * Only the pure re-centring case is exempt: if the reset had inventory to
+   * liquidate, it fired in a move that actually put capital at risk, and
+   * waiting for that to calm down is the behaviour the cooldown was designed
+   * for.
+   */
+  private rebuildDelayApplies(): boolean {
+    if (!this.cfg.resetSkipCooldownWhenFlat) return true;
+    const record = this.resetRecords[this.resetRecords.length - 1];
+    if (!record) return true;
+    return record.ethInventoryBefore > DUST_USD;
+  }
+
+  /** Re-centre the grid at `price` and complete the open reset record. */
+  private rebuildAt(price: number, timestamp: number): void {
     const oldBounds = this.bounds();
     this.center = price;
     this.buildLevels();
@@ -854,7 +1141,6 @@ export class GridStrategy {
         newUpperBound: newBounds.upper,
       });
     }
-    return true;
   }
 
   /** Cooldown seconds after breaker escalation. */
@@ -868,6 +1154,13 @@ export class GridStrategy {
 
   /** Std-dev of per-observation log returns over the lookback window. */
   private realizedVolatility(): number | null {
+    if (this.volCacheValid) return this.volCache;
+    this.volCache = this.computeRealizedVolatility();
+    this.volCacheValid = true;
+    return this.volCache;
+  }
+
+  private computeRealizedVolatility(): number | null {
     const n = this.cfg.volLookbackPoints;
     if (this.priceHistory.length < n + 1) return null;
     const recent = this.priceHistory.slice(-(n + 1));

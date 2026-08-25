@@ -22,6 +22,9 @@ export interface FoldResult {
   name: string;
   trainRange: [number, number];
   testRange: [number, number];
+  /** Window lengths in years, used to annualize the returns. */
+  trainYears: number;
+  testYears: number;
   best: GridCandidate;
   train: ConfigMetrics;
   test: ConfigMetrics;
@@ -92,14 +95,37 @@ function runFold(
   // beyond its own first price.
   const testMetrics = evaluate(best.candidate, { ...options.input, prices: test });
 
+  const span = (points: PricePoint[]) =>
+    (points[points.length - 1]!.timestamp - points[0]!.timestamp) / SECONDS_PER_YEAR;
+
   return {
     name,
     trainRange: [train[0]!.timestamp, train[train.length - 1]!.timestamp],
     testRange: [test[0]!.timestamp, test[test.length - 1]!.timestamp],
+    trainYears: span(train),
+    testYears: span(test),
     best: best.candidate,
     train: best,
     test: testMetrics,
   };
+}
+
+const SECONDS_PER_YEAR = 365 * 24 * 3600;
+
+/**
+ * Compound annual growth rate for a return measured over `years`.
+ *
+ * Walk-forward uses an EXPANDING training window, so train periods are
+ * several times longer than the test chunk that follows them. Comparing the
+ * raw returns therefore shows a large apparent "decay" that is purely a
+ * difference in elapsed time; annualizing is what makes the two comparable.
+ */
+export function annualize(returnPct: number, years: number): number {
+  if (!(years > 0)) return 0;
+  const growth = 1 + returnPct / 100;
+  // A total loss (or worse) has no real annual rate; report -100%.
+  if (growth <= 0) return -100;
+  return (Math.pow(growth, 1 / years) - 1) * 100;
 }
 
 export function formatFold(fold: FoldResult): string {
@@ -112,14 +138,26 @@ export function formatFold(fold: FoldResult): string {
   line();
   line(`Best configuration:  ${describeCandidate(fold.best)}`);
   line();
-  line(`TRAIN  ${day(fold.trainRange[0])} → ${day(fold.trainRange[1])}`);
-  line(`  Return:            ${pct(fold.train.returnPercent)}`);
+  line(
+    `TRAIN  ${day(fold.trainRange[0])} → ${day(fold.trainRange[1])}` +
+      `  (${fold.trainYears.toFixed(2)}y)`,
+  );
+  line(
+    `  Return:            ${pct(fold.train.returnPercent)}` +
+      `   [${pct(annualize(fold.train.returnPercent, fold.trainYears))} annualized]`,
+  );
   line(`  Max drawdown:      ${pct(fold.train.maxDrawdownPct)}`);
   line(`  Grid / reset P&L:  ${signedUsd(fold.train.totalGridPnL)} / ${signedUsd(fold.train.totalResetPnL)}`);
   line(`  Resets:            ${fold.train.numberOfResets}`);
   line();
-  line(`TEST   ${day(fold.testRange[0])} → ${day(fold.testRange[1])}`);
-  line(`  Return:            ${pct(fold.test.returnPercent)}`);
+  line(
+    `TEST   ${day(fold.testRange[0])} → ${day(fold.testRange[1])}` +
+      `  (${fold.testYears.toFixed(2)}y)`,
+  );
+  line(
+    `  Return:            ${pct(fold.test.returnPercent)}` +
+      `   [${pct(annualize(fold.test.returnPercent, fold.testYears))} annualized]`,
+  );
   line(`  Max drawdown:      ${pct(fold.test.maxDrawdownPct)}`);
   line(`  Grid / reset P&L:  ${signedUsd(fold.test.totalGridPnL)} / ${signedUsd(fold.test.totalResetPnL)}`);
   line(`  Resets:            ${fold.test.numberOfResets}`);
@@ -127,8 +165,12 @@ export function formatFold(fold: FoldResult): string {
   line(`  vs ETH hold:       ${pct(fold.test.benchmarks.vsEthPct)} pts`);
   line(`  vs USDC:           ${pct(fold.test.benchmarks.vsUsdcPct)} pts`);
   line();
-  const decay = fold.test.returnPercent - fold.train.returnPercent;
-  line(`Out-of-sample decay: ${pct(decay)} pts (test − train)`);
+  // Compare like with like: raw returns over unequal windows are not
+  // comparable, so the headline decay figure is on annualized rates.
+  const decay =
+    annualize(fold.test.returnPercent, fold.testYears) -
+    annualize(fold.train.returnPercent, fold.trainYears);
+  line(`Out-of-sample decay: ${pct(decay)} pts annualized (test − train)`);
   line(RULE);
   return lines.join("\n");
 }
@@ -142,7 +184,9 @@ export function formatWalkForwardSummary(folds: FoldResult[]): string {
   line("WALK-FORWARD SUMMARY");
   line(RULE);
   line();
-  line("Fold      Spacing  Width  Reset  Order   Train ret  Test ret   Test MaxDD  Test resets");
+  line(
+    "Fold      Spacing  Width  Reset  Order   Train ret  Train/yr   Test ret   Test/yr  Test MaxDD",
+  );
   line(THIN);
   for (const f of folds) {
     line(
@@ -153,21 +197,73 @@ export function formatWalkForwardSummary(folds: FoldResult[]): string {
         String(f.best.resetBufferLevels).padEnd(7),
         `${f.best.orderSizePercent}%`.padEnd(8),
         pct(f.train.returnPercent).padStart(10),
-        pct(f.test.returnPercent).padStart(10),
+        pct(annualize(f.train.returnPercent, f.trainYears)).padStart(10),
+        pct(f.test.returnPercent).padStart(11),
+        pct(annualize(f.test.returnPercent, f.testYears)).padStart(10),
         `${f.test.maxDrawdownPct.toFixed(1)}%`.padStart(12),
-        String(f.test.numberOfResets).padStart(13),
       ].join(""),
     );
   }
   line();
   const testReturns = folds.map((f) => f.test.returnPercent);
+  const testAnnual = folds.map((f) => annualize(f.test.returnPercent, f.testYears));
   const positive = testReturns.filter((r) => r > 0).length;
   const avg = testReturns.reduce((a, b) => a + b, 0) / Math.max(testReturns.length, 1);
+  const avgAnnual = testAnnual.reduce((a, b) => a + b, 0) / Math.max(testAnnual.length, 1);
   line(`Profitable out-of-sample folds:  ${positive}/${folds.length}`);
-  line(`Average out-of-sample return:    ${pct(avg)}`);
+  line(`Average out-of-sample return:    ${pct(avg)}  (${pct(avgAnnual)} annualized)`);
   const stable = new Set(folds.map((f) => `${f.best.spacingPercent}/${f.best.widthPercent}/${f.best.resetBufferLevels}/${f.best.orderSizePercent}`));
   line(`Distinct winning configurations: ${stable.size}/${folds.length}` +
     (stable.size === 1 ? "  (stable)" : "  (parameters drift between folds)"));
   line(RULE);
   return lines.join("\n");
+}
+
+export interface ConsensusPick {
+  candidate: GridCandidate;
+  /** How many folds picked this candidate as their train-best. */
+  foldWins: number;
+  /** Mean test return of the folds it won (percent). */
+  meanOosReturnPct: number;
+  /** Worst test return across the folds it won (percent). */
+  worstOosReturnPct: number;
+}
+
+/**
+ * Aggregate fold winners into a consensus ranking. A configuration that is
+ * the train-best in MANY folds — rather than only on the full period — is
+ * the one least likely to be a lucky historical artifact. Ranked by fold
+ * wins, then by out-of-sample return.
+ */
+export function selectConsensus(folds: FoldResult[]): ConsensusPick[] {
+  const byKey = new Map<string, ConsensusPick>();
+  for (const f of folds) {
+    const key = candidateKey(f.best);
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { candidate: f.best, foldWins: 0, meanOosReturnPct: 0, worstOosReturnPct: Infinity };
+      byKey.set(key, entry);
+    }
+    entry.foldWins++;
+    entry.meanOosReturnPct += f.test.returnPercent;
+    entry.worstOosReturnPct = Math.min(entry.worstOosReturnPct, f.test.returnPercent);
+  }
+  const picks = [...byKey.values()];
+  for (const p of picks) p.meanOosReturnPct /= Math.max(p.foldWins, 1);
+  picks.sort((a, b) => b.foldWins - a.foldWins || b.meanOosReturnPct - a.meanOosReturnPct);
+  return picks;
+}
+
+function candidateKey(c: GridCandidate): string {
+  return [
+    c.spacingPercent,
+    c.widthPercent,
+    c.resetBufferLevels,
+    c.orderSizePercent,
+    c.maxVolPerStep ?? "",
+    c.inventoryCapPercent ?? "",
+    c.cooldownHours ?? "",
+    c.resetSellFraction ?? "",
+    c.underwaterSkipPct ?? "",
+  ].join("|");
 }

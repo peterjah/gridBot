@@ -14,6 +14,7 @@ import {
   parseRankMetric,
   rank,
   riskAdjusted,
+  scoreRobustness,
   sweep,
 } from "../src/backtest/optimizer.js";
 import type { ConfigMetrics, EvaluationInput } from "../src/backtest/optimizer.js";
@@ -41,6 +42,7 @@ function base(overrides: Partial<GridConfig> = {}): GridConfig {
     levelsAbove: 5,
     levelsBelow: 5,
     orderSizeUsd: 1000,
+    executionMode: "taker",
     feeBps: 5,
     slippageBps: 3,
     minEthUsd: 0,
@@ -52,11 +54,17 @@ function base(overrides: Partial<GridConfig> = {}): GridConfig {
     lpVenueVolumeSharePct: 5,
     lpPoolLiquidityUsd: 0,
     lpFeeAprPct: 0,
+    lpReferenceRangePct: 0,
     regimeMaxMovePct: 0,
     regimeLookbackPoints: 336,
     regenMinSeconds: 3600,
     volLookbackPoints: 24,
     maxVolPerStep: 0.005,
+    resetConfirmObservations: 0,
+    resetVolPostpone: false,
+    resetHardDrawdownPct: 25,
+    resetHardInventoryLossPct: 0,
+    resetSkipCooldownWhenFlat: false,
     resetBreakerK: 3,
     resetBreakerWindowSeconds: 30 * 24 * 3600,
     ...overrides,
@@ -519,5 +527,85 @@ describe("scenario windows", () => {
     expect(result.medianReturnPct).toBeLessThanOrEqual(result.maxReturnPct);
     expect(result.winRate).toBeGreaterThanOrEqual(0);
     expect(result.winRate).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("robustness scoring", () => {
+  const mk = (
+    spacingPercent: number,
+    orderSizePercent: number,
+    returnPercent: number,
+  ): ConfigMetrics =>
+    ({
+      candidate: {
+        spacingPercent,
+        widthPercent: 10,
+        levelsAbove: 5,
+        levelsBelow: 5,
+        resetBufferLevels: 2,
+        orderSizePercent,
+        orderSizeUsd: 100,
+      },
+      returnPercent,
+      maxDrawdownPct: -1,
+      totalGridPnL: 0,
+      riskAdjustedScore: 0,
+      robustScore: returnPercent,
+      neighbourCount: 0,
+    }) as ConfigMetrics;
+
+  it("penalizes an isolated spike and rewards a plateau", () => {
+    // A 3x3 grid: one lucky spike at (1,1) surrounded by zeros, and a plateau
+    // of solid values around (3,5).
+    const metrics = [
+      mk(1, 1, 100), // the spike
+      mk(1, 2, 0),
+      mk(2, 1, 0),
+      mk(2, 2, 0),
+      mk(3, 5, 40), // plateau centre
+      mk(3, 10, 40),
+      mk(2, 5, 40),
+      mk(3, 2, 40),
+    ];
+    scoreRobustness(metrics);
+    const spike = metrics.find((m) => m.returnPercent === 100)!;
+    const plateau = metrics.find(
+      (m) => m.candidate.spacingPercent === 3 && m.candidate.orderSizePercent === 5,
+    )!;
+    // The spike's neighbours are all zero, so its median collapses.
+    expect(spike.robustScore).toBeLessThan(spike.returnPercent);
+    expect(plateau.robustScore).toBeGreaterThan(spike.robustScore);
+    // Ranking by ROBUST must prefer the plateau; by RETURN, the spike.
+    expect(rank(metrics, "RETURN")[0]!.returnPercent).toBe(100);
+    expect(rank(metrics, "ROBUST")[0]!.robustScore).toBe(plateau.robustScore);
+  });
+
+  it("leaves a configuration with no neighbours on its own return", () => {
+    const metrics = [mk(1, 1, 42)];
+    scoreRobustness(metrics);
+    expect(metrics[0]!.neighbourCount).toBe(0);
+    expect(metrics[0]!.robustScore).toBe(42);
+  });
+
+  it("counts only adjacent values on a single axis", () => {
+    // Values 1,2,3 on one axis: the middle one has two neighbours, the ends
+    // one each. A diagonal move (two axes at once) is not a neighbour.
+    const metrics = [mk(1, 1, 10), mk(2, 1, 20), mk(3, 1, 30), mk(2, 2, 99)];
+    scoreRobustness(metrics);
+    const mid = metrics.find(
+      (m) => m.candidate.spacingPercent === 2 && m.candidate.orderSizePercent === 1,
+    )!;
+    expect(mid.neighbourCount).toBe(3); // 1, 3 on spacing; 2 on order size
+    const corner = metrics.find((m) => m.returnPercent === 99)!;
+    expect(corner.neighbourCount).toBe(1); // only (2,1)
+  });
+
+  it("is populated automatically by a sweep", () => {
+    const result = sweep(
+      { spacings: [1, 2, 3], widths: [10, 20], resetBuffers: [2], orderFractions: [5] },
+      input(walk(500)),
+    );
+    expect(result.metrics.length).toBeGreaterThan(2);
+    expect(result.metrics.some((m) => m.neighbourCount > 0)).toBe(true);
   });
 });

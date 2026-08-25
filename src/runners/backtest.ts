@@ -6,6 +6,7 @@ import type { AppConfig } from "../config.js";
 import { assertAccountingReconciles, runBacktest } from "../backtest/backtester.js";
 import {
   ethHoldBenchmark,
+  passiveLpWithFeesBenchmark,
   staticLpBenchmark,
   usdcOnlyBenchmark,
 } from "../backtest/benchmarks.js";
@@ -17,10 +18,12 @@ import {
   formatResetSummary,
 } from "../backtest/resetReport.js";
 import { writeEquityCsv, writeResetCsv, writeTradeLedger } from "../backtest/csv.js";
+import { loadAaveAprSeries } from "../backtest/lendingYield.js";
 import { writeChartReport } from "../backtest/chart.js";
 import { candidateFromConfig, runDir, saveRun } from "../backtest/runStore.js";
 import { candidateSpec, describeCandidate, metricsFor } from "../backtest/optimizer.js";
 import { logger } from "../utils/logger.js";
+import { captureProvenance } from "../backtest/provenance.js";
 
 /**
  * Load the configured CSV price series, optionally joined with a daily pool
@@ -64,7 +67,20 @@ export async function runBacktestMode(cfg: AppConfig): Promise<void> {
   const fillModel = new LinearCostFillModel(cfg.grid.feeBps, cfg.grid.slippageBps);
   const strategy = new GridStrategy(cfg.grid, fillModel);
 
-  const result = runBacktest(strategy, prices, cfg.estimatedGasUsd);
+  // Optional Aave supply-yield model on idle USDC.
+  let aaveYield: { series: ReturnType<typeof loadAaveAprSeries>; bufferUsdc: number } | undefined;
+  if (cfg.aaveYieldFile) {
+    const series = loadAaveAprSeries(cfg.aaveYieldFile);
+    logger.info("Aave yield modeling enabled", {
+      aaveYieldFile: cfg.aaveYieldFile,
+      days: series.length,
+      bufferUsdc: cfg.lendBufferUsdc,
+      firstAprPct: series[0]!.aprPct,
+    });
+    aaveYield = { series, bufferUsdc: cfg.lendBufferUsdc };
+  }
+
+  const result = runBacktest(strategy, prices, cfg.gas, cfg.lendingGasLegs, aaveYield);
   // Fail loudly rather than reporting numbers that do not add up.
   assertAccountingReconciles(result);
 
@@ -73,6 +89,17 @@ export async function runBacktestMode(cfg: AppConfig): Promise<void> {
     ethHoldBenchmark({ prices, initialUsdc: cfg.grid.initialUsdc, initialEth: cfg.grid.initialEth }),
     staticLpBenchmark({ prices, initialUsdc: cfg.grid.initialUsdc, initialEth: cfg.grid.initialEth }),
   ];
+
+  // Only meaningful when a fee series is loaded; otherwise it degenerates to
+  // the no-fee static LP already above.
+  if (prices.some((p) => (p.feeAprPct ?? 0) > 0)) {
+    const bench = { prices, initialUsdc: cfg.grid.initialUsdc, initialEth: cfg.grid.initialEth };
+    const span = Math.max(cfg.grid.levelsAbove, cfg.grid.levelsBelow);
+    const gridRangePct = (Math.pow(1 + cfg.grid.spacingPercent / 100, span) - 1) * 100;
+    // Matched to the grid's own band, plus a wide reference position.
+    benchmarks.push(passiveLpWithFeesBenchmark(bench, gridRangePct));
+    benchmarks.push(passiveLpWithFeesBenchmark(bench, 50));
+  }
 
   console.log(formatReport(result, benchmarks, cfg.grid));
   console.log();
@@ -100,10 +127,31 @@ export async function runBacktestMode(cfg: AppConfig): Promise<void> {
     base: cfg.grid,
     estimatedGasUsd: cfg.estimatedGasUsd,
   });
+  const runLpActive =
+    prices.some((p) => (p.feeAprPct ?? 0) > 0) ||
+    cfg.grid.lpFeeAprPct > 0 ||
+    cfg.grid.lpPoolLiquidityUsd > 0;
+  const runCalibration = prices.some((p) => (p.feeAprPct ?? 0) > 0)
+    ? ("measured-apr-series" as const)
+    : cfg.grid.lpFeeAprPct > 0
+      ? ("constant-apr" as const)
+      : cfg.grid.lpPoolLiquidityUsd > 0
+        ? ("volume-share" as const)
+        : ("none" as const);
+  const runProvenance = captureProvenance({
+    pricesFile: cfg.csvFile,
+    aprFile: cfg.aprFile,
+    lpFeeIncomeActive: runLpActive,
+    lpCalibration: runCalibration,
+    // The backtester does not model money-market yield; the live bot's Aave
+    // lending is a separate concern and is never included in these figures.
+    lendingYield: false,
+  });
   const runPath = saveRun(cfg.resultsDir, {
     label: cfg.runLabel,
     mode: "backtest",
     createdAt: new Date().toISOString(),
+    provenance: runProvenance,
     dataFile: cfg.csvFile,
     periodStart: result.start.timestamp,
     periodEnd: result.end.timestamp,

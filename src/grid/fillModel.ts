@@ -56,3 +56,32 @@ export class LinearCostFillModel implements FillModel {
     };
   }
 }
+
+/**
+ * Cost-free fills, for liquidity that is already deposited in the pool.
+ *
+ * When price crosses a tick range the AMM converts the position at the pool
+ * price; the liquidity provider pays nothing. The fee is paid by whoever
+ * swapped against it, and reaches this position through the fee-income model
+ * instead. Charging a swap cost here as well would bill the same dollar as
+ * both the provider and the taker of the same trade.
+ */
+export class ZeroCostFillModel implements FillModel {
+  quoteBuy(levelPrice: number, quoteUsd: number) {
+    return {
+      ethOut: quoteUsd / levelPrice,
+      effectivePrice: levelPrice,
+      feeUsd: 0,
+      slippageUsd: 0,
+    };
+  }
+
+  quoteSell(levelPrice: number, ethIn: number) {
+    return {
+      usdcOut: ethIn * levelPrice,
+      effectivePrice: levelPrice,
+      feeUsd: 0,
+      slippageUsd: 0,
+    };
+  }
+}

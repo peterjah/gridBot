@@ -1,6 +1,7 @@
 import type { AppConfig } from "../config.js";
 import { RULE, day, pct, usd } from "../backtest/format.js";
 import type { EvaluationInput } from "../backtest/optimizer.js";
+import { loadAaveAprSeries } from "../backtest/lendingYield.js";
 import { candidateSpec, describeCandidate } from "../backtest/optimizer.js";
 import {
   formatScenarioDetail,
@@ -14,6 +15,7 @@ import { saveRun, runDir } from "../backtest/runStore.js";
 import { writeScenarioCsv } from "../backtest/csv.js";
 import { logger } from "../utils/logger.js";
 import { loadPrices } from "./backtest.js";
+import { captureProvenance } from "../backtest/provenance.js";
 
 /**
  * Optimize for a market SCENARIO rather than for one stretch of history:
@@ -25,10 +27,17 @@ export async function runScenarioMode(cfg: AppConfig): Promise<void> {
   const opt = cfg.optimizer;
   const filter = opt.scenario;
 
+
+  const aaveYield = cfg.aaveYieldFile
+    ? { series: loadAaveAprSeries(cfg.aaveYieldFile), bufferUsdc: cfg.lendBufferUsdc }
+    : undefined;
   const input: Omit<EvaluationInput, "prices"> = {
     base: cfg.grid,
     estimatedGasUsd: cfg.estimatedGasUsd,
+    gas: cfg.gas,
+    lendingGasLegs: cfg.lendingGasLegs,
     autoCenter: opt.autoCenter,
+    aaveYield,
   };
 
   console.log(RULE);
@@ -74,10 +83,31 @@ export async function runScenarioMode(cfg: AppConfig): Promise<void> {
     (a, b) => a.metrics.returnPercent - b.metrics.returnPercent,
   );
   const medianEntry = sorted[Math.floor(sorted.length / 2)]!;
+  const scLpActive =
+    prices.some((p) => (p.feeAprPct ?? 0) > 0) ||
+    cfg.grid.lpFeeAprPct > 0 ||
+    cfg.grid.lpPoolLiquidityUsd > 0;
+  const scCalibration = prices.some((p) => (p.feeAprPct ?? 0) > 0)
+    ? ("measured-apr-series" as const)
+    : cfg.grid.lpFeeAprPct > 0
+      ? ("constant-apr" as const)
+      : cfg.grid.lpPoolLiquidityUsd > 0
+        ? ("volume-share" as const)
+        : ("none" as const);
+  const scProvenance = captureProvenance({
+    pricesFile: cfg.csvFile,
+    aprFile: cfg.aprFile,
+    lpFeeIncomeActive: scLpActive,
+    lpCalibration: scCalibration,
+    // The backtester does not model money-market yield; the live bot's Aave
+    // lending is a separate concern and is never included in these figures.
+    lendingYield: false,
+  });
   const runPath = saveRun(cfg.resultsDir, {
     label: cfg.runLabel,
     mode: "optimize",
     createdAt: new Date().toISOString(),
+    provenance: scProvenance,
     dataFile: `${cfg.csvFile} [scenario ${filter.moveMin}..${filter.moveMax}% / ${windows.length}w]`,
     periodStart: medianEntry.window.prices[0]!.timestamp,
     periodEnd: medianEntry.window.prices[medianEntry.window.prices.length - 1]!.timestamp,

@@ -4,6 +4,8 @@ import type { GridConfig } from "../grid/types.js";
 import type { ConfigMetrics, GridCandidate, RankMetric, SweepAxes } from "./optimizer.js";
 import { candidateSpec, levelsForWidth } from "./optimizer.js";
 import { RULE, THIN, day, pct, signedUsd, usd } from "./format.js";
+import type { Provenance } from "./provenance.js";
+import { logger } from "../utils/logger.js";
 import { writeCsv } from "./csv.js";
 
 /**
@@ -30,6 +32,11 @@ export interface RunSummary {
   spec: string;
   description: string;
   metrics: ConfigMetrics;
+  /**
+   * Everything needed to reproduce this number. Optional only so older
+   * archived runs still load; every new run records it.
+   */
+  provenance?: Provenance;
   /** Out-of-sample result, when the run computed one. */
   outOfSample?: {
     trainReturnPct: number;
@@ -55,6 +62,26 @@ export function saveRun(resultsDir: string, summary: RunSummary): string {
   const dir = runDir(resultsDir, summary.label);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "run.json");
+
+  // Reusing a label silently replaced the previous result, so a figure quoted
+  // from an earlier run of the same name could no longer be checked against
+  // anything. Supersession is now recorded rather than erased.
+  if (existsSync(path)) {
+    try {
+      const previous = JSON.parse(readFileSync(path, "utf8")) as RunSummary;
+      const archive = join(dir, `superseded-${previous.createdAt.replace(/[:.]/g, "-")}.json`);
+      writeFileSync(archive, `${JSON.stringify(previous, null, 2)}\n`);
+      logger.warn("Run label reused; previous result archived", {
+        label: summary.label,
+        previousReturn: previous.metrics.returnPercent,
+        previousCode: previous.provenance?.code.srcSha256 ?? "unrecorded",
+        archive,
+      });
+    } catch {
+      // An unreadable previous record must not block the new one.
+    }
+  }
+
   writeFileSync(path, `${JSON.stringify(summary, null, 2)}\n`);
   return path;
 }
@@ -186,6 +213,26 @@ export function formatComparison(runs: RunSummary[]): string {
   for (const run of sorted) {
     line(`  ${run.label.padEnd(22)}${run.description}`);
   }
+
+  line();
+  line("Provenance (code fingerprint · income model · dataset):");
+  for (const run of sorted) {
+    const p = run.provenance;
+    if (!p) {
+      line(`  ${run.label.padEnd(22)}UNRECORDED — predates provenance capture, not auditable`);
+      continue;
+    }
+    const income = p.income.lpFeeIncome ? `LP fees (${p.income.lpCalibration})` : "no LP fees";
+    const lend = p.income.lendingYield ? " + lending yield" : "";
+    const prices = p.datasets.find((d) => d.role === "prices");
+    line(
+      `  ${run.label.padEnd(22)}${p.code.srcSha256}${p.code.dirty ? "*" : " "}  ${income}${lend}` +
+        `  ${prices ? `${prices.rows} rows @ ${prices.sha256}` : ""}`,
+    );
+  }
+  line();
+  line("  * = working tree was dirty; the src hash identifies what actually ran.");
+  line("  Runs with different code fingerprints are NOT comparable.");
 
   const withOos = sorted.filter((r) => r.outOfSample);
   if (withOos.length > 0) {

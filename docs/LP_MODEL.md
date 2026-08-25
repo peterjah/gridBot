@@ -148,6 +148,26 @@ levels: +16.4%) because it is not an independent axis — it is derived from
 width ÷ spacing, and the good cells are wide grids (±20-30%) at 3% spacing.
 Read the width and spacing columns, not the level count alone.
 
+## The benchmark that matters: passive LP
+
+Once fee income is the dominant revenue source, "does it beat ETH?" is the
+wrong question — the strategy is competing with simply providing liquidity.
+`passiveLpWithFeesBenchmark` models that: one deposit into a fixed band,
+collecting the same measured pool APR while in range, never trading.
+
+At matched band width the grid loses to it in every configuration tested, by
+34 to 65 percentage points. The cause is structural rather than a tuning
+problem:
+
+* a passive position keeps 100% of its capital in range earning fees;
+* the grid deploys only 38–48% on average, the rest sitting idle;
+* resets take the grid out of the market entirely during cooldown, and fee
+  income is rent for presence.
+
+The trading overlay contributes a few hundred dollars of grid P&L against a
+multi-thousand-dollar shortfall in fee capture. Any future work on this
+strategy should be measured against this benchmark first.
+
 ## Interaction with the regime filter
 
 Fee income is rent paid for *presence*. Standing aside during large moves

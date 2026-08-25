@@ -1,14 +1,26 @@
-# Grid Bot — systematic grid market-making on Uniswap V3 (Base)
+# Grid Bot — grid market-making on Uniswap V3 (Base)
 
-A **systematic grid / market-making strategy implemented using Uniswap V3** on
-the Base network. The bot trades a configurable price grid: it buys ETH as
-price moves down through grid levels, sells as price moves up, and harvests
-the spread. The objective is to accumulate value in **USD/USDC** from
-volatility while controlling directional exposure.
+Two ways to run the same idea — buy as price falls, sell as price rises — on
+Base, plus the backtesting and parameter-optimization tooling used to choose
+between them.
 
-This is **not** an LP-position rebalancer. There is no "move the range when
-price leaves it" logic. The core concepts are GRID, TRADES, INVENTORY,
+**`lp-live` — LP re-centring (recommended).** One concentrated Uniswap V3
+position is held around spot. The pool itself does the buying and selling: as
+price falls through the range your USDC is converted into ETH, as it rises it
+is converted back, at no fee and no gas. You earn a pro-rata share of the pool
+fee that swappers pay. When price drifts past the configured trigger, the
+position is closed, fees collected, tokens rebalanced and a fresh position
+minted at the new centre. See [docs/LP_REBALANCE.md](docs/LP_REBALANCE.md).
+
+**`live` — taker grid.** An explicit ladder of levels executed as swaps
+through SwapRouter02. You choose every fill, and you pay the pool fee plus
+slippage plus gas on each one. The core concepts are GRID, TRADES, INVENTORY,
 PROFIT and USD VALUE.
+
+The two are the *same strategy* at different cost structures: a V3 position is
+already a grid with infinitely fine spacing, executed by the AMM for free. On
+identical 5-minute Base ETH/USDC data the difference is large and consistent —
+see [Which mode](#which-mode) below.
 
 ```
 Price data ──►  GridStrategy (pure)  ──►  actions: BUY / SELL / LIQUIDATE
@@ -29,9 +41,56 @@ execution adapters change.
 | `backtest` | `npm run backtest` | CSV file | simulated (fee/slippage/gas model) |
 | `paper` | `npm run paper` | live Base pool price | none — decisions logged only |
 | `live` | `npm run live` | live Base pool price | real swaps via SwapRouter02 |
+| `lp-live` | `npm run lp-live` | live Base pool price | V3 position mint/burn/collect via NonfungiblePositionManager |
+| `lp` | `npm run lp` | CSV file | passive-LP sweep over range width and re-centring buffer |
 | `optimize` | `npm run optimize` | CSV file | parameter sweep, ranked + out-of-sample |
 | `walk-forward` | `npm run walk-forward` | CSV file | train → test folds |
 | `compare` | `npm run compare` | saved runs | side-by-side comparison |
+
+## Which mode
+
+Identical strategy, identical data, identical config — only the cost structure
+differs. Archived under `results/AUDIT-mode-taker/` and `results/AUDIT-mode-lp/`
+with full provenance. Dataset `data/base-eth-usdc-5m.csv` (210,240 rows,
+2024-08-22 → 2026-08-22), LP fee income calibrated from the measured pool APR
+series, TVL floor $5M, lending yield **not** included.
+
+Both columns below are the **grid** strategy — same levels, same resets — with
+only the cost structure swapped (`--lp-mode 0/1`). It isolates what paying the
+pool fee costs versus earning it. It is *not* a measurement of `lp-live`.
+
+| | grid, paying the fee | grid, earning the fee |
+| --- | --- | --- |
+| Return | **−26.44%** | **+113.38%** |
+| Max drawdown | −26.49% | −8.56% |
+| Fee income | $0 | $16,821 |
+| Fees + slippage + gas paid | $450 | $139 |
+
+The entire positive return is fee income: grid P&L is $53 and $861 respectively
+on $10,000 of capital — rounding error next to the cost structure. That is the
+case for being an LP rather than a taker, and it is the most robust result in
+this repository.
+
+What `lp-live` actually runs — a single re-centred position — measures **+50.4%**
+over the same window in-sample, and **loses money in 3 of 4 walk-forward folds**
+(average −7.78%, `results/AUDIT-lp-oos-orig/`). The in-sample figure came from a
+training window containing a large ETH run-up; it measured the market, not the
+strategy.
+
+A concentrated LP position is structurally long the volatile asset. It beat
+holding ETH in 3 of 4 folds — the fee income is real — but beating ETH in a −39%
+quarter still means losing 30% of the account.
+
+A regime filter (`REGIME_MAX_MOVE_PCT`) that stands aside during big
+directional moves reliably cuts the worst fold from −29.7% to roughly −10%, at
+the cost of being parked 55–69% of the time. It removes the drawdown; it does
+not create return.
+
+**So: the cost-structure result is solid, the parameter choice is not, and no
+configuration tested is yet a strategy worth funding.** Run
+`npm run lp -- --folds 4` and judge on the out-of-sample table, never the
+full-period one. Read [docs/LP_REBALANCE.md](docs/LP_REBALANCE.md) before sizing
+anything.
 
 ## How the grid works
 
@@ -68,6 +127,23 @@ This is deliberately simple (no trend prediction): it bounds how much
 inventory the strategy can drag through a trend and keeps it flat while the
 market is violent.
 
+### Smart-reset guards
+
+The reset is a risk mechanism; four deterministic guards keep it from being
+the biggest cost center (on 2024–2026 real data they cut reset losses ~70%
+and flipped a −2.9% default result to +3.4%):
+
+* `RESET_CONFIRM_OBSERVATIONS` — price must close outside the band N
+  consecutive extra observations before a reset fires (whipsaw filter).
+* `RESET_VOL_POSTPONE` — postpone the liquidation while realized volatility
+  exceeds the gate; sell in calmer conditions.
+* `RESET_SELL_FRACTION` / `RESET_UNDERWATER_SKIP_PCT` — carry inventory
+  instead of dumping: unsold lots are recovered by the re-centered grid's
+  sell levels on the way back up.
+* `RESET_HARD_DRAWDOWN_PCT` — backstop: portfolio drawdown from peak beyond
+  this forces a full liquidation regardless of everything above, so carried
+  inventory can never ride a collapse unbounded.
+
 ### Volatility protections
 
 Three deterministic safeguards reduce exposure to hostile markets:
@@ -90,6 +166,27 @@ Grid fills are executed as **Uniswap V3 swaps** (SwapRouter02) when the
 strategy detects a crossing — chosen after evaluating range-order approaches
 for V1. See [docs/EXECUTION_APPROACH.md](docs/EXECUTION_APPROACH.md) for the
 full analysis and the upgrade path to range orders.
+
+## Running the LP bot
+
+`./start.sh` packages the whole launch: preflight checks, typecheck and tests,
+a fresh 5-minute data pull to seed the regime filter, a summary of what is
+about to run with the honest caveats, and the launch itself.
+
+```bash
+./start.sh                 # dry run — plans and logs, broadcasts nothing
+./start.sh --live          # broadcast (asks you to type "deploy")
+./start.sh --help          # all options
+```
+
+Defaults: ±5% band, re-centre beyond 50% of the half-width, regime filter on at
+3% over 168h, 24h between re-centres. Override with `--range`, `--buffer`,
+`--regime-move`, `--regime-hours`.
+
+It refuses to start without `RPC_URL` and `POOL_ADDRESS`, and without a key or
+wallet address. `--live` additionally requires `PRIVATE_KEY` and an interactive
+confirmation. See [docs/LP_REBALANCE.md](docs/LP_REBALANCE.md) before funding
+anything.
 
 ## Installation
 
@@ -295,16 +392,47 @@ npm run backtest -- --csv data/eth-1h.csv \
   --lp-venue-share 1 --lp-pool-liquidity 15000000
 ```
 
-**Measured result on real ETH (2021-2026, $10k):** with a middle calibration
-(1% of Binance volume routed through the pool, $15M competing TVL, 5bps),
-the best of 176 configurations returns **+127.9%** over 5.6 years with a
-−1.1% max drawdown, profitable in every calendar year including 2022's −68%
-crash — but still **110 points behind ETH buy-and-hold**. Critically, the
-trading is *net negative* (grid P&L +$287, reset P&L −$557): **LP fee income
-supplies all of the profit.** The result is therefore a function of the
-assumed pool economics, not of the strategy. Sweeping that assumption moves
-the answer from **+2% to +12,318%** — see the sensitivity table in
-`docs/LP_MODEL.md` before trusting any single number.
+Prefer the **measured pool APR** calibration (`--apr-file`) over guessing a
+volume share and depth — see `docs/LP_MODEL.md`. Fee income is adjusted for
+concentration (a narrow band earns more per dollar than a wide one) and
+diluted by the pool's own liquidity density, so a position cannot earn more
+than the fees the pool actually generates.
+
+**Measured result** on real ETH with the measured Base WETH/USDC 0.05% APR
+series, 2024-04 → 2026-08, $10k: the best grid configuration returns
+**+100.1%** with a **−1.4%** max drawdown. Fee income (+$9,736) supplies
+essentially all of it; trading nets +$338.
+
+### Grid vs passive LP
+
+Once fee income is modeled, the benchmark that matters is not ETH — it is a
+**passive LP position in the same pool**. `npm run lp` runs that as a
+first-class strategy, sweeps its parameters, and puts the winner head to head
+with the grid over the same data:
+
+```bash
+npm run lp -- --csv data/eth-1h.csv --apr-file data/base-weth-usdc-005.csv \
+  --min-pool-tvl 5000000
+```
+
+| | Grid (tuned) | Passive LP ±10% | Passive LP ±5% (re-centred) |
+| --- | --- | --- | --- |
+| Return | **+267.7%** | +114.4% | +104.4% |
+| Max drawdown | **−1.4%** | −24.7% | −7.4% |
+| Return / \|drawdown\| | **198** | 4.6 | 14.2 |
+| Fee income | **+$28,214** | +$14,386 | +$20,283 |
+| Position / trading P&L | −$1,149 | −$2,950 | −$9,689 |
+| Transactions | 302 | 0 | 187 |
+| Time earning fees | 35.4% deployed | 25.2% in range | 97% in range |
+
+The grid wins on both axes once it is tuned tightly, and the reason is
+mechanical: **re-centring is what keeps concentrated liquidity in range.** A
+passive ±10% position drifts out of its band and stops earning — in range only
+25% of the time. The grid follows price, so despite deploying just 35% of its
+capital it collects nearly twice the fees. A passive position can only match
+that by going very tight AND re-centring often, at which point it is paying
+the same rebalancing costs the grid pays, with none of the spread capture.
+
 
 ### Causal regime filter
 
@@ -400,6 +528,15 @@ sample, the average out-of-sample return, and whether the winning parameters
 were stable across folds or drifted — the difference between a robust
 configuration and a lucky one.
 
+### Optimization: walk-forward by default
+
+`npm run optimize` no longer ranks configurations by full-period return —
+that is how overfit winners get picked. By default it runs expanding-window
+walk-forward folds, selects the configuration that wins the most folds
+(consensus), and reports mean/worst out-of-sample returns alongside the
+full-period figures as reference only. Set `OPTIMIZER_SELECTION=full` to get
+the legacy behavior explicitly.
+
 ### Benchmarks & honest accounting
 
 Every backtest reports against passive alternatives:
@@ -436,6 +573,44 @@ RPC_URL=https://mainnet.base.org npm run live
 Each fill is quoted via QuoterV2 with an on-chain slippage floor, simulated
 before signing, and its receipt verified. Refuses to start without
 `LIVE_CONFIRM=yes`.
+
+### Paper soak workflow
+
+```bash
+npm run paper 2>&1 | tee -a paper.log   # keep everything
+npm run soak-report -- --log paper.log  # daily check (table + go/no-go hints)
+```
+
+The daily check looks at errors, drift warnings and portfolio trajectory.
+Success criterion before the live pilot: realized fills within ~2x of the
+modeled slippage, zero unexplained drift, no crash loops.
+
+### Lending idle liquidity on Aave
+
+Between grid fills most capital sits idle — usually USDC waiting for dips,
+sometimes ETH waiting for rallies. With `ENABLE_AAVE=true` (live mode), the
+bot supplies whatever exceeds a configurable liquid buffer to **Aave V3 on
+Base** and earns supply yield on it:
+
+* By default **all idle assets are lent**: both buffers default to `0`.
+  Amounts below `LEND_MIN_ACTION_USD` stay in the wallet (gas-churn guard).
+* The idle sweep runs every `LEND_INTERVAL_SECONDS`; newly freed capital
+  (sell proceeds, unused buy budget) is lent on the next sweep.
+* Before any BUY/SELL that would exceed the wallet balance, the shortfall is
+  automatically withdrawn from Aave first — so trading works even with a zero
+  liquid balance, at the cost of one extra transaction per fill. Set
+  `LEND_BUFFER_USDC` / `LEND_BUFFER_ETH` > 0 to avoid that extra tx.
+* Addresses default to the official Aave V3 Base deployments
+  (`AAVE_POOL`, `aBasUSDC`, `aBasWETH`) sourced from the
+  [aave address book](https://github.com/aave-dao/aave-address-book).
+
+Paper mode reports what *would* be lent (`wouldLend` field).
+
+Historical supply-rate data for this pool now exists — `npm run fetch-apr`
+pulls it (`data/aave-base-usdc.csv`: 896 days, median **4.11%** APY), so the
+backtest can model the yield rather than treating it as unquantified upside.
+Analysis of what it is worth, and of the gas cost of keeping lent assets
+withdrawable on demand, is in `docs/GAS_AND_LENDING.md`.
 
 ## Development
 

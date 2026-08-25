@@ -6,6 +6,7 @@ import { sqrtRatioToPrice } from "../utils/math.js";
 import { LinearCostFillModel } from "../grid/fillModel.js";
 import { GridStrategy } from "../grid/gridStrategy.js";
 import type { AppConfig } from "../config.js";
+import { planLendingActions } from "../lending/policy.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -32,6 +33,7 @@ export async function runPaperMode(cfg: AppConfig): Promise<void> {
   });
 
   let tick = 0;
+  let lastUtcDay: string | null = null;
   for (;;) {
     try {
       const state = await getPoolState(client, pool.address);
@@ -41,10 +43,53 @@ export async function runPaperMode(cfg: AppConfig): Promise<void> {
         pool.token1.decimals,
       );
 
-      const actions = strategy.onPriceUpdate(price, Math.floor(Date.now() / 1000));
+      const nowSec = Math.floor(Date.now() / 1000);
+      const actions = strategy.onPriceUpdate(price, nowSec);
       const s = strategy.getState();
 
+      // Machine-parseable events for `npm run soak-report`.
+      for (const a of actions) {
+        logger.info("Paper fill", {
+          side: a.type,
+          levelPrice: a.price,
+          amount: a.type === "BUY" ? a.quoteAmount : a.baseAmount,
+          gridLevel: a.type === "LIQUIDATE" ? null : a.gridLevel,
+          usdc: s.usdc,
+          eth: s.eth,
+          portfolioValue: strategy.getPortfolioValue(price),
+          realizedGridGrossUsd: s.realizedGrossUsd,
+          realizedResetGrossUsd: s.realizedResetGrossUsd,
+        });
+      }
+      const utcDay = new Date(nowSec * 1000).toISOString().slice(0, 10);
+      if (utcDay !== lastUtcDay) {
+        if (lastUtcDay !== null) {
+          logger.info("Paper day close", {
+            day: lastUtcDay,
+            price,
+            portfolioValue: strategy.getPortfolioValue(price),
+            usdc: s.usdc,
+            eth: s.eth,
+            cycles: s.completedCycles,
+          });
+        }
+        lastUtcDay = utcDay;
+      }
+
       if (actions.length > 0 || tick % 10 === 0) {
+        const lendPlan = cfg.lendingEnabled
+          ? planLendingActions(
+              {
+                bufferUsdcUsd: cfg.lendBufferUsdcUsd,
+                bufferEth: cfg.lendBufferEth,
+                minActionUsd: cfg.lendMinActionUsd,
+              },
+              // Paper balances are simulated; nothing is lent yet.
+              { usdcWallet: s.usdc, usdcLent: 0, ethWallet: s.eth, ethLent: 0 },
+              price,
+            )
+          : [];
+
         logger.info("Paper cycle", {
           price,
           actions: actions.map((a) =>
@@ -57,6 +102,7 @@ export async function runPaperMode(cfg: AppConfig): Promise<void> {
           portfolioValue: strategy.getPortfolioValue(price).toFixed(2),
           cycles: s.completedCycles,
           realizedGrossUsd: s.realizedGrossUsd.toFixed(2),
+          wouldLend: lendPlan.map((l) => `${l.kind} ${l.amount.toFixed(2)} ${l.asset}`),
         });
       }
 

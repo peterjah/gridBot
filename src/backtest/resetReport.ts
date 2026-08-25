@@ -182,6 +182,11 @@ export function formatInventoryReport(result: BacktestResult): string {
   line(`Max USDC balance:             ${usd(inv.maxUsdcUsd)}`);
   line(`Average USDC balance:         ${usd(inv.avgUsdcUsd)}`);
   line();
+  line();
+  line(`Avg capital deployed:         ${inv.avgDeployedPct.toFixed(1)}% of portfolio` +
+    ` (range ${inv.minDeployedPct.toFixed(1)}%–${inv.maxDeployedPct.toFixed(1)}%)`);
+  line(`Avg capital idle:             ${inv.avgIdlePct.toFixed(1)}% (${usd(inv.avgIdleUsd)})`);
+  line();
   line(`Max inventory cost basis:     ${usd(inv.maxCostBasisUsd)} (at ${date(inv.maxCostBasisAt)})`);
   line(`Avg inventory cost basis:     ${usd(inv.avgCostBasisUsd)}`);
   line(RULE);

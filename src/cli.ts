@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import type { GridConfig } from "./grid/types.js";
 import type { AppConfig, GridSettings } from "./config.js";
+import { pctToTicks } from "./config.js";
 import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
 
 /**
@@ -15,24 +16,52 @@ import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
  *   --order-size 500     notional per grid order
  *   --fee-bps 5          swap fee per fill
  *   --slippage-bps 3     slippage per fill
- *   --gas 0.02           estimated gas USD per trade
+ *   --gas 0.02           estimated gas USD per fill (flat model)
+ *   --gas-tx-overhead 0  fixed cost per batched transaction (multicall)
+ *   --gas-per-fill 0.02  marginal cost of each extra swap leg in a batch
+ *   --gas-lending-leg 0  extra cost when a tx also moves money-market funds
  *   --min-eth-usd 0      ETH exposure floor
  *   --max-eth-usd 1e12   ETH exposure ceiling
  *   --reset-buffer 2     spacings beyond outermost level that trigger a grid
  *                        reset (0 disables resetting)
  *   --reset-sell-fraction 1   fraction of inventory sold at a reset
  *   --reset-underwater-skip 0 carry inventory underwater by more than this %
+ *   --reset-skip-cooldown-when-flat  rebuild immediately when a reset had no
+ *                        inventory to sell (default off)
  *   --lp-pool-liquidity 0  competing liquidity in your range, USD
  *                        (0 = no LP fee income, the default)
  *   --lp-venue-share 5   % of the data's volume that routes through your pool
  *   --lp-apr 50          measured pool fee APR (%), preferred calibration
  *   --apr-file path      daily APR series joined onto the price data
+ *   --aave-yield-file p  daily Aave supply-APR CSV; enables lending yield
+ *                        on idle USDC in backtests
  *   --lp-fee-bps 5       pool fee tier used for LP fee income
  *   --regime-max-move 0  pause the grid when the trailing move exceeds this %
+ *   --lp-regime-moves 0,10,20  LP sweep axis: stand aside above these trailing
+ *                        moves (0 = filter off)
  *   --regime-lookback 336 observations in the regime lookback window
  *   --regen-min-seconds   minimum cooldown seconds before rebuilding (default 21600)
  *   --vol-lookback 24    observations used for volatility estimate
  *   --max-vol 0.005      rebuild only when per-step volatility is below this
+ *
+ * Live LP re-centring (MODE=lp-live):
+ *   --lp-range 5            half-width of the managed range, percent
+ *   --lp-recenter-buffer 50 re-centre once price is this % of the half-width
+ *                           beyond the range edge (matches the sweep column
+ *                           recenter_buffer_pct)
+ *   --lp-width-ticks N      explicit tick half-width, overrides --lp-range
+ *   --lp-threshold-ticks N  explicit tick trigger, overrides the buffer
+ *   --lp-recenter-hours 24  minimum hours between re-centres
+ *   --lp-slippage-bps 50    slippage tolerance on the rebalancing swap and mint
+ *   --lp-regime-move 0      stand aside above this trailing move % (0 = off)
+ *   --lp-regime-hours 168   lookback window for the regime filter, hours
+ *   --lp-seed-file path     price CSV used to pre-fill the regime window
+ *                        (omit to start blind; never defaults to CSV_FILE)
+ *   --position-id 0         position NFT to manage (0 = mint a fresh one)
+ *   --state-file path       where the managed token id is persisted
+ *   --dry-run false         actually broadcast (also needs LIVE_CONFIRM=yes)
+ *   --log path           paper log file for soak-report
+ *   --days N             soak report window (0 = all)
  *   --csv path           price data file
  *   --report path        output HTML report file
  *   --results dir        directory for CSV exports (default "results")
@@ -63,6 +92,10 @@ import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
  *   --sell-fractions 1,0.5,0        fraction of inventory sold at a reset
  *   --underwater-skips 0,10,20      carry inventory when underwater by more
  *                                   than this % instead of selling it
+ *   --skip-flat-cooldowns 0,1       rebuild immediately when a reset was flat
+ *   --confirm-observations 0,2,4    confirmations before a band exit liquidates
+ *   --vol-postpones 0,1             postpone liquidation while volatile
+ *   --hard-drawdowns 0,15,25        drawdown backstop forcing a liquidation
  *
  * Scenario mode (`--mode scenario`): judge configurations on every historical
  * window matching a market profile, ranked on the MEDIAN across windows.
@@ -156,9 +189,15 @@ export function applyNamedConfig(cfg: AppConfig, spec: string): void {
       case "cooldown": g.regenMinSeconds = value * 3600; break;
       case "sell": g.resetSellFraction = value; break;
       case "underwater": g.resetUnderwaterSkipPct = value; break;
+      case "skip-flat-cooldown": g.resetSkipCooldownWhenFlat = value !== 0; break;
+      case "hard-inv-loss": g.resetHardInventoryLossPct = value; break;
+      case "hard-dd": g.resetHardDrawdownPct = value; break;
+      case "confirm": g.resetConfirmObservations = Math.trunc(value); break;
+      case "vol-postpone": g.resetVolPostpone = value !== 0; break;
       case "lp-venue-share": g.lpVenueVolumeSharePct = value; break;
       case "lp-pool-liquidity": g.lpPoolLiquidityUsd = value; break;
       case "lp-apr": g.lpFeeAprPct = value; break;
+      case "lp-mode": g.executionMode = value !== 0 ? "lp" : "taker"; break;
       case "lp-fee-bps": g.lpFeeBps = value; break;
       case "regime-max-move": g.regimeMaxMovePct = value; break;
       case "regime-lookback": g.regimeLookbackPoints = Math.trunc(value); break;
@@ -188,17 +227,25 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
       case "centerPrice": g.centerPrice = Number(v); break;
       case "orderSizeUsd": g.orderSizeUsd = Number(v); break;
       case "feeBps": g.feeBps = Number(v); break;
+      case "executionMode": g.executionMode = v === "lp" ? "lp" : "taker"; break;
       case "slippageBps": g.slippageBps = Number(v); break;
-      case "estimatedGasUsd": cfg.estimatedGasUsd = Number(v); break;
+      case "estimatedGasUsd":
+        cfg.estimatedGasUsd = Number(v);
+        // Keep the structured model in step when only the flat knob is set.
+        cfg.gas.perFillUsd = Number(v);
+        break;
       case "minEthUsd": g.minEthUsd = Number(v); break;
       case "maxEthUsd": g.maxEthUsd = Number(v); break;
       case "resetBufferLevels": g.resetBufferLevels = Number(v); break;
       case "resetSellFraction": g.resetSellFraction = Number(v); break;
       case "resetUnderwaterSkipPct": g.resetUnderwaterSkipPct = Number(v); break;
+      case "resetSkipCooldownWhenFlat": g.resetSkipCooldownWhenFlat = v !== "false"; break;
+      case "resetHardInventoryLossPct": g.resetHardInventoryLossPct = Number(v); break;
       case "lpFeeBps": g.lpFeeBps = Number(v); break;
       case "lpVenueVolumeSharePct": g.lpVenueVolumeSharePct = Number(v); break;
       case "lpPoolLiquidityUsd": g.lpPoolLiquidityUsd = Number(v); break;
       case "lpFeeAprPct": g.lpFeeAprPct = Number(v); break;
+      case "lpReferenceRangePct": g.lpReferenceRangePct = Number(v); break;
       case "regimeMaxMovePct": g.regimeMaxMovePct = Number(v); break;
       case "regimeLookbackPoints": g.regimeLookbackPoints = Math.trunc(Number(v)); break;
       case "regenMinSeconds": g.regenMinSeconds = Number(v); break;
@@ -221,6 +268,7 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   set("levelsBelow", args["levels-below"]);
   set("orderSizeUsd", args["order-size"]);
   set("feeBps", args["fee-bps"]);
+  set("executionMode", args["execution-mode"]);
   set("slippageBps", args["slippage-bps"]);
   set("estimatedGasUsd", args["gas"]);
   set("minEthUsd", args["min-eth-usd"]);
@@ -228,10 +276,13 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   set("resetBufferLevels", args["reset-buffer"]);
   set("resetSellFraction", args["reset-sell-fraction"]);
   set("resetUnderwaterSkipPct", args["reset-underwater-skip"]);
+  set("resetSkipCooldownWhenFlat", args["reset-skip-cooldown-when-flat"]);
+  set("resetHardInventoryLossPct", args["reset-hard-inventory-loss"]);
   set("lpFeeBps", args["lp-fee-bps"]);
   set("lpVenueVolumeSharePct", args["lp-venue-share"]);
   set("lpPoolLiquidityUsd", args["lp-pool-liquidity"]);
   set("lpFeeAprPct", args["lp-apr"]);
+  set("lpReferenceRangePct", args["lp-reference-range"]);
   set("regimeMaxMovePct", args["regime-max-move"]);
   set("regimeLookbackPoints", args["regime-lookback"]);
   set("regenMinSeconds", args["regen-min-seconds"]);
@@ -245,7 +296,59 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   if (args["results"] !== undefined) cfg.resultsDir = args["results"];
   if (args["label"] !== undefined) cfg.runLabel = args["label"];
   if (args["apr-file"] !== undefined) cfg.aprFile = args["apr-file"];
+  if (args["aave-yield-file"] !== undefined) cfg.aaveYieldFile = args["aave-yield-file"];
+  if (args["log"] !== undefined) cfg.soakLogFile = args["log"];
   if (args["min-pool-tvl"] !== undefined) cfg.minPoolTvlUsd = Number(args["min-pool-tvl"]);
+  const lpRanges = argNumList("lp-ranges", args["lp-ranges"]);
+  const lpBuffers = argNumList("lp-recenter-buffers", args["lp-recenter-buffers"]);
+  const lpHours = argNumList("lp-recenter-hours", args["lp-recenter-hours"]);
+  const lpRegimes = argNumList("lp-regime-moves", args["lp-regime-moves"]);
+  if (lpRanges || lpBuffers || lpHours || lpRegimes) {
+    cfg.lpAxes = {
+      rangePcts: lpRanges ?? [5, 10, 15, 20, 30, 50, 75],
+      recenterBuffers: lpBuffers ?? [0, 10, 25, 50, 100],
+      recenterMinHours: lpHours ?? [24],
+      regimeMaxMovePcts: lpRegimes ?? [0],
+    };
+  }
+  if (args["gas-tx-overhead"] !== undefined) cfg.gas.txOverheadUsd = Number(args["gas-tx-overhead"]);
+  if (args["gas-per-fill"] !== undefined) cfg.gas.perFillUsd = Number(args["gas-per-fill"]);
+  if (args["gas-lending-leg"] !== undefined) {
+    cfg.gas.lendingLegUsd = Number(args["gas-lending-leg"]);
+    // Naming the cost is enough to opt in; no separate flag needed.
+    cfg.lendingGasLegs = true;
+  }
+
+  // Live LP re-centring (mode lp-live). Percent flags are re-derived into
+  // ticks so --lp-range / --lp-recenter-buffer accept the same numbers the
+  // passive-LP sweep reports.
+  const lpr = cfg.lpRebalance;
+  if (args["lp-range"] !== undefined) lpr.rangePct = Number(args["lp-range"]);
+  if (args["lp-recenter-buffer"] !== undefined) {
+    lpr.recenterBufferPct = Number(args["lp-recenter-buffer"]);
+  }
+  if (args["lp-range"] !== undefined || args["lp-recenter-buffer"] !== undefined) {
+    lpr.widthTicks = pctToTicks(lpr.rangePct);
+    lpr.thresholdTicks = pctToTicks(lpr.rangePct * (1 + lpr.recenterBufferPct / 100));
+  }
+  if (args["lp-width-ticks"] !== undefined) lpr.widthTicks = Math.trunc(Number(args["lp-width-ticks"]));
+  if (args["lp-threshold-ticks"] !== undefined) {
+    lpr.thresholdTicks = Math.trunc(Number(args["lp-threshold-ticks"]));
+  }
+  if (args["lp-recenter-hours"] !== undefined && cfg.mode === "lp-live") {
+    lpr.recenterMinHours = Number(args["lp-recenter-hours"]);
+  }
+  if (args["lp-slippage-bps"] !== undefined) lpr.slippageBps = Number(args["lp-slippage-bps"]);
+  if (args["lp-regime-move"] !== undefined) lpr.regimeMaxMovePct = Number(args["lp-regime-move"]);
+  if (args["lp-regime-hours"] !== undefined) {
+    lpr.regimeLookbackHours = Number(args["lp-regime-hours"]);
+  }
+  if (args["lp-seed-file"] !== undefined) {
+    lpr.seedFile = args["lp-seed-file"] === "" ? null : args["lp-seed-file"];
+  }
+  if (args["position-id"] !== undefined) lpr.positionId = BigInt(args["position-id"]);
+  if (args["state-file"] !== undefined) lpr.stateFile = args["state-file"];
+  if (args["dry-run"] !== undefined) lpr.dryRun = args["dry-run"] !== "false";
 
   // A named configuration overrides the individual flags above.
   if (args["config"] !== undefined) applyNamedConfig(cfg, args["config"]);
@@ -275,6 +378,14 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   if (sellFractions) o.axes.sellFractions = sellFractions;
   const underwaterSkips = argNumList("underwater-skips", args["underwater-skips"]);
   if (underwaterSkips) o.axes.underwaterSkips = underwaterSkips;
+  const skipFlats = argNumList("skip-flat-cooldowns", args["skip-flat-cooldowns"]);
+  if (skipFlats) o.axes.skipFlatCooldowns = skipFlats;
+  const confirms = argNumList("confirm-observations", args["confirm-observations"]);
+  if (confirms) o.axes.confirmObservations = confirms;
+  const postpones = argNumList("vol-postpones", args["vol-postpones"]);
+  if (postpones) o.axes.volPostpones = postpones;
+  const hardDds = argNumList("hard-drawdowns", args["hard-drawdowns"]);
+  if (hardDds) o.axes.hardDrawdowns = hardDds;
 
   // Scenario window selection.
   const sc = o.scenario;

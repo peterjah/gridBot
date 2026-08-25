@@ -178,6 +178,11 @@ export function rankScenario(results: ScenarioResult[], metric: RankMetric): Sce
         return -Math.abs(r.medianMaxDrawdownPct);
       case "GRID_PNL":
         return r.medianGridPnL;
+      // Scenario mode already ranks on the median across windows, which is
+      // the same robustness idea applied across time rather than across
+      // parameter space; there is no separate neighbourhood to consult.
+      case "ROBUST":
+        return r.medianReturnPct;
     }
   };
   return [...results].sort(

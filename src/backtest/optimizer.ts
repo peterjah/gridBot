@@ -3,7 +3,9 @@ import type { GridConfig } from "../grid/types.js";
 import { GridStrategy } from "../grid/gridStrategy.js";
 import { LinearCostFillModel } from "../grid/fillModel.js";
 import { assertAccountingReconciles, runBacktest } from "./backtester.js";
+import type { GasModel } from "./gasModel.js";
 import type { BacktestResult } from "./backtester.js";
+import type { AaveAprPoint } from "./lendingYield.js";
 import { ethHoldBenchmark, staticLpBenchmark, usdcOnlyBenchmark } from "./benchmarks.js";
 import { RULE, THIN, pct, signedUsd, usd } from "./format.js";
 
@@ -33,6 +35,14 @@ export interface GridCandidate {
   resetSellFraction?: number;
   /** Carry inventory instead of selling when underwater by more than this %. */
   underwaterSkipPct?: number;
+  /** Rebuild immediately when a reset had no inventory to sell. */
+  skipCooldownWhenFlat?: boolean;
+  /** Observations a band exit must persist before it liquidates. */
+  confirmObservations?: number;
+  /** Postpone the liquidation while realized volatility is elevated. */
+  volPostpone?: boolean;
+  /** Drawdown-from-peak that forces a full liquidation regardless. */
+  hardDrawdownPct?: number;
 }
 
 /**
@@ -59,6 +69,14 @@ export interface SweepAxes {
   sellFractions?: number[];
   /** Underwater thresholds (%) beyond which a reset carries its inventory. */
   underwaterSkips?: number[];
+  /** Skip the post-reset cooldown when flat: [0], [1] or both. */
+  skipFlatCooldowns?: number[];
+  /** Confirmation observations before a band exit liquidates. */
+  confirmObservations?: number[];
+  /** Postpone liquidation while volatile: [0], [1] or both. */
+  volPostpones?: number[];
+  /** Hard drawdown backstops (%); 0 disables. */
+  hardDrawdowns?: number[];
 }
 
 export const DEFAULT_AXES: SweepAxes = {
@@ -75,6 +93,10 @@ export function activeAxes(axes: SweepAxes): {
   cooldown: boolean;
   sell: boolean;
   underwater: boolean;
+  skipFlat: boolean;
+  confirm: boolean;
+  postpone: boolean;
+  hardDd: boolean;
 } {
   return {
     vol: (axes.maxVols?.length ?? 0) > 0,
@@ -82,12 +104,27 @@ export function activeAxes(axes: SweepAxes): {
     cooldown: (axes.cooldownHours?.length ?? 0) > 0,
     sell: (axes.sellFractions?.length ?? 0) > 0,
     underwater: (axes.underwaterSkips?.length ?? 0) > 0,
+    skipFlat: (axes.skipFlatCooldowns?.length ?? 0) > 0,
+    confirm: (axes.confirmObservations?.length ?? 0) > 0,
+    postpone: (axes.volPostpones?.length ?? 0) > 0,
+    hardDd: (axes.hardDrawdowns?.length ?? 0) > 0,
   };
 }
 
-export type RankMetric = "RETURN" | "RISK_ADJUSTED" | "DRAWDOWN" | "GRID_PNL";
+export type RankMetric =
+  | "RETURN"
+  | "RISK_ADJUSTED"
+  | "DRAWDOWN"
+  | "GRID_PNL"
+  | "ROBUST";
 
-export const RANK_METRICS: RankMetric[] = ["RETURN", "RISK_ADJUSTED", "DRAWDOWN", "GRID_PNL"];
+export const RANK_METRICS: RankMetric[] = [
+  "RETURN",
+  "RISK_ADJUSTED",
+  "DRAWDOWN",
+  "GRID_PNL",
+  "ROBUST",
+];
 
 /** Passive comparisons computed for every configuration (spec section 13). */
 export interface BenchmarkComparison {
@@ -120,8 +157,25 @@ export interface ConfigMetrics {
   maxResetLoss: number;
   maxEthExposurePct: number;
   avgEthExposurePct: number;
+  /** Time-averaged share of the portfolio working as liquidity, percent. */
+  avgDeployedPct: number;
+  /** Time-averaged idle balance, USD — the money-market opportunity. */
+  avgIdleUsd: number;
   /** returnPercent / |maxDrawdownPct|, drawdown-free runs handled safely. */
   riskAdjustedScore: number;
+  /**
+   * Median return of this configuration together with its immediate
+   * neighbours in parameter space. Populated by `scoreRobustness`.
+   *
+   * A configuration that only wins because one lucky cell spiked is
+   * surrounded by mediocre neighbours and scores badly here; one sitting on a
+   * plateau scores close to its own return. Selecting on this prefers regions
+   * that are stable under small parameter changes — which is what "these
+   * parameters will still work next month" actually requires.
+   */
+  robustScore: number;
+  /** Number of neighbours found; 0 means the score is just the own return. */
+  neighbourCount: number;
   benchmarks: BenchmarkComparison;
 }
 
@@ -130,6 +184,12 @@ export interface EvaluationInput {
   /** Base config; capital, costs and vol controls are taken from here. */
   base: GridConfig;
   estimatedGasUsd: number;
+  /** Structured gas model; falls back to the flat per-fill cost above. */
+  gas?: GasModel;
+  /** Charge money-market legs on trading transactions. */
+  lendingGasLegs?: boolean;
+  /** Daily Aave supply-APR series; enables lending income on idle USDC. */
+  aaveYield?: { series: AaveAprPoint[]; bufferUsdc: number };
   /** Center the grid on the first price of the series (default true). */
   autoCenter?: boolean;
 }
@@ -178,6 +238,18 @@ export function buildCandidates(axes: SweepAxes, capitalUsd: number): GridCandid
   const underwaters: (number | undefined)[] = axes.underwaterSkips?.length
     ? axes.underwaterSkips
     : [undefined];
+  const skipFlats: (number | undefined)[] = axes.skipFlatCooldowns?.length
+    ? axes.skipFlatCooldowns
+    : [undefined];
+  const confirms: (number | undefined)[] = axes.confirmObservations?.length
+    ? axes.confirmObservations
+    : [undefined];
+  const postpones: (number | undefined)[] = axes.volPostpones?.length
+    ? axes.volPostpones
+    : [undefined];
+  const hardDds: (number | undefined)[] = axes.hardDrawdowns?.length
+    ? axes.hardDrawdowns
+    : [undefined];
 
   for (const spacingPercent of axes.spacings) {
     for (const widthPercent of axes.widths) {
@@ -189,20 +261,34 @@ export function buildCandidates(axes: SweepAxes, capitalUsd: number): GridCandid
               for (const cooldown of cooldowns) {
                 for (const resetSellFraction of sells) {
                   for (const underwaterSkipPct of underwaters) {
-                    candidates.push({
-                      spacingPercent,
-                      widthPercent,
-                      levelsAbove: levels,
-                      levelsBelow: levels,
-                      resetBufferLevels,
-                      orderSizePercent,
-                      orderSizeUsd: (capitalUsd * orderSizePercent) / 100,
-                      maxVolPerStep,
-                      inventoryCapPercent,
-                      cooldownHours: cooldown,
-                      resetSellFraction,
-                      underwaterSkipPct,
-                    });
+                    for (const skipFlat of skipFlats) {
+                      for (const confirm of confirms) {
+                        for (const postpone of postpones) {
+                          for (const hardDrawdownPct of hardDds) {
+                            candidates.push({
+                              spacingPercent,
+                              widthPercent,
+                              levelsAbove: levels,
+                              levelsBelow: levels,
+                              resetBufferLevels,
+                              orderSizePercent,
+                              orderSizeUsd: (capitalUsd * orderSizePercent) / 100,
+                              maxVolPerStep,
+                              inventoryCapPercent,
+                              cooldownHours: cooldown,
+                              resetSellFraction,
+                              underwaterSkipPct,
+                              skipCooldownWhenFlat:
+                                skipFlat === undefined ? undefined : skipFlat !== 0,
+                              confirmObservations: confirm,
+                              volPostpone:
+                                postpone === undefined ? undefined : postpone !== 0,
+                              hardDrawdownPct,
+                            });
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -274,6 +360,12 @@ export function candidateConfig(
         : candidate.cooldownHours * 3600,
     resetSellFraction: candidate.resetSellFraction ?? input.base.resetSellFraction,
     resetUnderwaterSkipPct: candidate.underwaterSkipPct ?? input.base.resetUnderwaterSkipPct,
+    resetSkipCooldownWhenFlat:
+      candidate.skipCooldownWhenFlat ?? input.base.resetSkipCooldownWhenFlat,
+    resetConfirmObservations:
+      candidate.confirmObservations ?? input.base.resetConfirmObservations,
+    resetVolPostpone: candidate.volPostpone ?? input.base.resetVolPostpone,
+    resetHardDrawdownPct: candidate.hardDrawdownPct ?? input.base.resetHardDrawdownPct,
   };
 }
 
@@ -281,7 +373,13 @@ export function candidateConfig(
 export function evaluate(candidate: GridCandidate, input: EvaluationInput): ConfigMetrics {
   const cfg = candidateConfig(candidate, input);
   const strategy = new GridStrategy(cfg, new LinearCostFillModel(cfg.feeBps, cfg.slippageBps));
-  const result = runBacktest(strategy, input.prices, input.estimatedGasUsd);
+  const result = runBacktest(
+    strategy,
+    input.prices,
+    input.gas ?? input.estimatedGasUsd,
+    input.lendingGasLegs ?? false,
+    input.aaveYield,
+  );
   // A configuration whose books do not balance must never be ranked.
   assertAccountingReconciles(result);
   return metricsFor(candidate, result, input);
@@ -314,7 +412,12 @@ export function metricsFor(
     maxResetLoss: resetPnls.length ? Math.min(...resetPnls, 0) : 0,
     maxEthExposurePct: result.inventory.maxEthExposurePct,
     avgEthExposurePct: result.inventory.avgEthExposurePct,
+    avgDeployedPct: result.inventory.avgDeployedPct,
+    avgIdleUsd: result.inventory.avgIdleUsd,
     riskAdjustedScore: riskAdjusted(result.returnPct, result.maxDrawdownPct),
+    // Filled in by scoreRobustness once the whole sweep is known.
+    robustScore: result.returnPct,
+    neighbourCount: 0,
     benchmarks: benchmarkComparison(result, input),
   };
 }
@@ -374,7 +477,74 @@ export function sweep(axes: SweepAxes, input: EvaluationInput): SweepResult {
     }
   }
 
+  // Robustness is a property of the sweep, not of one run, so it can only be
+  // scored once every candidate has been evaluated.
+  scoreRobustness(metrics);
+
   return { metrics, skipped, generated: candidates.length };
+}
+
+/**
+ * Two candidates are neighbours when they differ on exactly one axis, and on
+ * that axis their values are adjacent in the swept list. Mutates `metrics` to
+ * fill in `robustScore` / `neighbourCount`.
+ */
+export function scoreRobustness(metrics: ConfigMetrics[]): ConfigMetrics[] {
+  const axisOf = (m: ConfigMetrics): number[] => [
+    m.candidate.spacingPercent,
+    m.candidate.widthPercent,
+    m.candidate.resetBufferLevels,
+    m.candidate.orderSizePercent,
+    m.candidate.maxVolPerStep ?? 0,
+    m.candidate.inventoryCapPercent ?? 0,
+    m.candidate.cooldownHours ?? 0,
+    m.candidate.resetSellFraction ?? 1,
+    m.candidate.underwaterSkipPct ?? 0,
+  ];
+
+  const vectors = metrics.map(axisOf);
+  const axisCount = vectors[0]?.length ?? 0;
+  // Sorted unique values per axis, so "adjacent" means one step on the grid
+  // the sweep actually explored rather than an arbitrary numeric distance.
+  const levels: number[][] = [];
+  for (let a = 0; a < axisCount; a++) {
+    levels.push([...new Set(vectors.map((v) => v[a]!))].sort((x, y) => x - y));
+  }
+  const indexOf = levels.map((vals) => new Map(vals.map((v, i) => [v, i])));
+
+  const coords = vectors.map((v) => v.map((val, a) => indexOf[a]!.get(val)!));
+  const byKey = new Map<string, number>();
+  coords.forEach((c, i) => byKey.set(c.join(","), i));
+
+  metrics.forEach((m, i) => {
+    const c = coords[i]!;
+    const returns: number[] = [m.returnPercent];
+    let found = 0;
+    for (let a = 0; a < axisCount; a++) {
+      for (const delta of [-1, 1]) {
+        const probe = [...c];
+        probe[a] = probe[a]! + delta;
+        if (probe[a]! < 0 || probe[a]! >= levels[a]!.length) continue;
+        const j = byKey.get(probe.join(","));
+        if (j === undefined) continue;
+        returns.push(metrics[j]!.returnPercent);
+        found++;
+      }
+    }
+    m.robustScore = median(returns);
+    m.neighbourCount = found;
+  });
+
+  return metrics;
+}
+
+/** Median of a numeric list. Local copy to keep this module self-contained. */
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1]! + sorted[mid]!) / 2
+    : sorted[mid]!;
 }
 
 /** Sort a copy of `metrics` best-first under the chosen ranking metric. */
@@ -392,6 +562,8 @@ export function rank(metrics: ConfigMetrics[], metric: RankMetric): ConfigMetric
         return -Math.abs(m.maxDrawdownPct);
       case "GRID_PNL":
         return m.totalGridPnL;
+      case "ROBUST":
+        return m.robustScore;
     }
   };
   return [...metrics].sort((a, b) => score(b) - score(a) || b.returnPercent - a.returnPercent);
@@ -427,6 +599,14 @@ export function describeCandidate(c: GridCandidate): string {
       c.underwaterSkipPct > 0 ? `carry below -${c.underwaterSkipPct}%` : "no underwater carry",
     );
   }
+  if (c.skipCooldownWhenFlat !== undefined) {
+    parts.push(c.skipCooldownWhenFlat ? "fast rebuild when flat" : "always cool down");
+  }
+  if (c.confirmObservations !== undefined) parts.push(`confirm ${c.confirmObservations}`);
+  if (c.volPostpone !== undefined) parts.push(c.volPostpone ? "vol-postpone" : "no vol-postpone");
+  if (c.hardDrawdownPct !== undefined) {
+    parts.push(c.hardDrawdownPct > 0 ? `hard DD ${c.hardDrawdownPct}%` : "no hard DD");
+  }
   return parts.join(" · ");
 }
 
@@ -443,6 +623,12 @@ export function candidateSpec(c: GridCandidate): string {
   if (c.cooldownHours !== undefined) parts.push(`cooldown=${c.cooldownHours}`);
   if (c.resetSellFraction !== undefined) parts.push(`sell=${c.resetSellFraction}`);
   if (c.underwaterSkipPct !== undefined) parts.push(`underwater=${c.underwaterSkipPct}`);
+  if (c.skipCooldownWhenFlat !== undefined) {
+    parts.push(`skip-flat-cooldown=${c.skipCooldownWhenFlat ? 1 : 0}`);
+  }
+  if (c.confirmObservations !== undefined) parts.push(`confirm=${c.confirmObservations}`);
+  if (c.volPostpone !== undefined) parts.push(`vol-postpone=${c.volPostpone ? 1 : 0}`);
+  if (c.hardDrawdownPct !== undefined) parts.push(`hard-dd=${c.hardDrawdownPct}`);
   return parts.join(",");
 }
 
@@ -464,6 +650,10 @@ export function formatRankedTable(
         cooldown: ranked.some((m) => m.candidate.cooldownHours !== undefined),
         sell: ranked.some((m) => m.candidate.resetSellFraction !== undefined),
         underwater: ranked.some((m) => m.candidate.underwaterSkipPct !== undefined),
+        skipFlat: ranked.some((m) => m.candidate.skipCooldownWhenFlat !== undefined),
+        confirm: ranked.some((m) => m.candidate.confirmObservations !== undefined),
+        postpone: ranked.some((m) => m.candidate.volPostpone !== undefined),
+        hardDd: ranked.some((m) => m.candidate.hardDrawdownPct !== undefined),
       };
 
   const head: [string, number][] = [
@@ -478,6 +668,10 @@ export function formatRankedTable(
   if (show.cooldown) head.push(["Cool", 7]);
   if (show.sell) head.push(["Sell", 7]);
   if (show.underwater) head.push(["Carry", 8]);
+  if (show.skipFlat) head.push(["FastRb", 8]);
+  if (show.confirm) head.push(["Confirm", 9]);
+  if (show.postpone) head.push(["Postpn", 8]);
+  if (show.hardDd) head.push(["HardDD", 8]);
 
   const tail: [string, number][] = [
     ["Return", 9],
@@ -524,6 +718,13 @@ export function formatRankedTable(
     if (show.underwater) {
       const u = c.underwaterSkipPct;
       left.push(u === undefined ? "—" : u > 0 ? `-${u}%` : "off");
+    }
+    if (show.skipFlat) left.push(c.skipCooldownWhenFlat === undefined ? "—" : c.skipCooldownWhenFlat ? "yes" : "no");
+    if (show.confirm) left.push(c.confirmObservations === undefined ? "—" : String(c.confirmObservations));
+    if (show.postpone) left.push(c.volPostpone === undefined ? "—" : c.volPostpone ? "yes" : "no");
+    if (show.hardDd) {
+      const h = c.hardDrawdownPct;
+      left.push(h === undefined ? "—" : h > 0 ? `${h}%` : "off");
     }
 
     const right = [

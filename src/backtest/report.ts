@@ -67,6 +67,9 @@ export function formatReport(
   if (r.feeIncomeUsd > 0) {
     line(`D. LP fee income:  ${signedUsd(r.feeIncomeUsd)}   (earned resting in range)`);
   }
+  if (r.lendingIncomeUsd > 0) {
+    line(`E. Lending income: ${signedUsd(r.lendingIncomeUsd)}   (Aave yield on idle USDC)`);
+  }
   line();
   line(`C. Swap fees:      ${signedUsd(-r.totalFeeUsd)}`);
   line(`   Slippage:       ${signedUsd(-r.totalSlippageUsd)}`);

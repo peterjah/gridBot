@@ -1,6 +1,9 @@
 import type { GridStrategy } from "../grid/gridStrategy.js";
 import type { PricePoint } from "../data/provider.js";
 import type { ResetRecord, TradeRecord } from "../grid/types.js";
+import { flatGasModel, gasForObservation, gasPerFill } from "./gasModel.js";
+import { accrueInterest, aprForTimestamp, type AaveAprPoint } from "./lendingYield.js";
+import type { GasModel } from "./gasModel.js";
 
 export interface EquitySample {
   timestamp: number;
@@ -12,6 +15,10 @@ export interface EquitySample {
   costBasisUsd: number;
   /** ETH value as a share of portfolio value, in percent. */
   ethExposurePct: number;
+  /** Capital committed as liquidity (resting orders + inventory), USD. */
+  deployedUsd: number;
+  /** USDC not committed to any resting order, USD. */
+  idleUsd: number;
 }
 
 /** Inventory statistics over the whole run (section 5 of the spec). */
@@ -27,6 +34,17 @@ export interface InventoryStats {
   avgCostBasisUsd: number;
   /** Price and time at which the largest cost basis was carried. */
   maxCostBasisAt: number;
+  /**
+   * Capital efficiency: share of the portfolio actually working as liquidity,
+   * time-averaged, in percent. The complement is the balance a money market
+   * could lend, so this sizes that opportunity directly.
+   */
+  avgDeployedPct: number;
+  avgIdlePct: number;
+  minDeployedPct: number;
+  maxDeployedPct: number;
+  /** Time-averaged idle balance in USD. */
+  avgIdleUsd: number;
 }
 
 /**
@@ -42,6 +60,8 @@ export interface PnlBreakdown {
   resetPnlUsd: number;
   unrealizedPnlUsd: number;
   feeIncomeUsd: number;
+  /** Aave supply yield earned on idle USDC (0 when modeling is off). */
+  lendingIncomeUsd: number;
   feesUsd: number;
   slippageUsd: number;
   gasUsd: number;
@@ -52,6 +72,8 @@ export interface PnlBreakdown {
 }
 
 export interface BacktestResult {
+  /** Aave supply yield earned on idle USDC (0 when modeling is off). */
+  lendingIncomeUsd: number;
   strategy: GridStrategy;
   samples: EquitySample[];
   /** Gas deducted per executed trade (USD). */
@@ -97,12 +119,22 @@ export const RECONCILE_TOLERANCE_USD = 1e-6;
 export function runBacktest(
   strategy: GridStrategy,
   data: PricePoint[],
-  estimatedGasUsd: number,
+  /** Flat per-fill cost, or a structured model for batched execution. */
+  gas: number | GasModel,
+  /** Whether transactions also carry money-market legs. */
+  lending = false,
+  /**
+   * Daily Aave supply-APR series; when provided, ALL USDC idle above
+   * `bufferUsdc` earns pro-rata yield, credited to the wallet each step.
+   */
+  aaveYield?: { series: AaveAprPoint[]; bufferUsdc: number },
 ): BacktestResult {
+  const gasModel: GasModel = typeof gas === "number" ? flatGasModel(gas) : gas;
   if (data.length < 2) throw new Error("Need at least 2 price points");
 
   const samples: EquitySample[] = [];
   let totalGasUsd = 0;
+  let totalLendingIncomeUsd = 0;
 
   const first = data[0]!;
   strategy.onPriceUpdate(first.price, first.timestamp, {
@@ -127,20 +159,46 @@ export function runBacktest(
       poolTvlUsd: point.poolTvlUsd,
     });
 
-    // Gas is charged per executed trade and deducted from USDC. The strategy
+    // Gas is charged per transaction and deducted from USDC. The strategy
     // itself stays gas-agnostic (gas is environment-specific), so the fills
-    // are stamped here — one gas charge per trade appended this step.
-    const newTrades = ledger.length - tradesBefore;
+    // are stamped here. Every fill produced by one observation is assumed to
+    // be submitted in a single batched transaction.
+    // In "lp" mode a grid crossing is the AMM converting deposited liquidity:
+    // no transaction is sent, so no gas is due. Only re-centring is a real
+    // transaction (burn + swap + mint), and those fills are the liquidations.
+    const appended = ledger.slice(tradesBefore);
+    const newTrades =
+      strategy.config.executionMode === "lp"
+        ? appended.filter((t) => t.liquidation).length
+        : appended.length;
+    const billable =
+      strategy.config.executionMode === "lp"
+        ? appended.filter((t) => t.liquidation)
+        : appended;
     if (newTrades > 0) {
-      const gas = newTrades * estimatedGasUsd;
-      totalGasUsd += gas;
-      for (let k = tradesBefore; k < ledger.length; k++) {
-        const trade = ledger[k]!;
-        trade.gasUsd = estimatedGasUsd;
-        trade.usdcBalanceAfter -= estimatedGasUsd;
-        trade.portfolioValueAfter -= estimatedGasUsd;
+      const gasCharged = gasForObservation(gasModel, newTrades, lending);
+      const perFill = gasPerFill(gasModel, newTrades, lending);
+      totalGasUsd += gasCharged;
+      for (const trade of billable) {
+        trade.gasUsd = perFill;
+        trade.usdcBalanceAfter -= perFill;
+        trade.portfolioValueAfter -= perFill;
       }
-      strategy.applyExternalDebit(gas);
+      strategy.applyExternalDebit(gasCharged);
+    }
+
+    // Lending yield on idle USDC (Aave supply APR), credited pro-rata.
+    if (aaveYield && aaveYield.series.length > 0) {
+      const aprPct = aprForTimestamp(aaveYield.series, point.timestamp);
+      if (aprPct !== null) {
+        const idle = Math.max(0, strategy.getState().usdc - aaveYield.bufferUsdc);
+        const dtSeconds = point.timestamp - data[i - 1]!.timestamp;
+        const interest = accrueInterest(idle, aprPct, dtSeconds);
+        if (interest > 0) {
+          totalLendingIncomeUsd += interest;
+          strategy.applyExternalDebit(-interest); // credit
+        }
+      }
     }
     void actions;
 
@@ -188,7 +246,8 @@ export function runBacktest(
     state.realizedGridGrossUsd +
     state.realizedResetGrossUsd +
     unrealizedPnlUsd +
-    state.feeIncomeUsd -
+    state.feeIncomeUsd +
+    totalLendingIncomeUsd -
     state.totalFeeUsd -
     state.totalSlippageUsd -
     totalGasUsd;
@@ -199,6 +258,7 @@ export function runBacktest(
     resetPnlUsd: state.realizedResetGrossUsd,
     unrealizedPnlUsd,
     feeIncomeUsd: state.feeIncomeUsd,
+    lendingIncomeUsd: totalLendingIncomeUsd,
     feesUsd: state.totalFeeUsd,
     slippageUsd: state.totalSlippageUsd,
     gasUsd: totalGasUsd,
@@ -209,7 +269,7 @@ export function runBacktest(
   return {
     strategy,
     samples,
-    gasPerTradeUsd: estimatedGasUsd,
+    gasPerTradeUsd: gasModel.perFillUsd,
     totalGasUsd,
     start: first,
     end: data[data.length - 1]!,
@@ -221,6 +281,7 @@ export function runBacktest(
     resetPnlUsd: state.realizedResetGrossUsd,
     unrealizedPnlUsd,
     feeIncomeUsd: state.feeIncomeUsd,
+    lendingIncomeUsd: totalLendingIncomeUsd,
     totalFeeUsd: state.totalFeeUsd,
     totalSlippageUsd: state.totalSlippageUsd,
     netProfitUsd: finalPortfolioValue - initialCapital,
@@ -251,7 +312,7 @@ export function assertAccountingReconciles(
     throw new Error(
       `Accounting reconciliation failed: residual ${b.residual.toExponential(3)} USD.\n` +
         `  initial ${b.initialCapital} + grid ${b.gridPnlUsd} + reset ${b.resetPnlUsd} ` +
-        `+ unrealized ${b.unrealizedPnlUsd} + lpFees ${b.feeIncomeUsd} ` +
+        `+ unrealized ${b.unrealizedPnlUsd} + lpFees ${b.feeIncomeUsd} + lending ${b.lendingIncomeUsd} ` +
         `- fees ${b.feesUsd} - slippage ${b.slippageUsd} ` +
         `- gas ${b.gasUsd} = ${b.reconstructed}, but portfolio = ${result.finalPortfolioValue}`,
     );
@@ -309,6 +370,11 @@ function inventoryStats(samples: EquitySample[]): InventoryStats {
   let maxCost = 0;
   let costSum = 0;
   let maxCostAt = samples[0]?.timestamp ?? 0;
+  let deployedPctSum = 0;
+  let idlePctSum = 0;
+  let idleUsdSum = 0;
+  let minDeployedPct = Infinity;
+  let maxDeployedPct = 0;
 
   for (const s of samples) {
     if (s.eth > maxEth) maxEth = s.eth;
@@ -322,6 +388,14 @@ function inventoryStats(samples: EquitySample[]): InventoryStats {
       maxCost = s.costBasisUsd;
       maxCostAt = s.timestamp;
     }
+    const pv = s.portfolioValue;
+    const dPct = pv > 0 ? (s.deployedUsd / pv) * 100 : 0;
+    const iPct = pv > 0 ? (s.idleUsd / pv) * 100 : 0;
+    deployedPctSum += dPct;
+    idlePctSum += iPct;
+    idleUsdSum += s.idleUsd;
+    if (dPct < minDeployedPct) minDeployedPct = dPct;
+    if (dPct > maxDeployedPct) maxDeployedPct = dPct;
   }
 
   const n = Math.max(samples.length, 1);
@@ -335,6 +409,11 @@ function inventoryStats(samples: EquitySample[]): InventoryStats {
     maxCostBasisUsd: maxCost,
     avgCostBasisUsd: costSum / n,
     maxCostBasisAt: maxCostAt,
+    avgDeployedPct: deployedPctSum / n,
+    avgIdlePct: idlePctSum / n,
+    minDeployedPct: Number.isFinite(minDeployedPct) ? minDeployedPct : 0,
+    maxDeployedPct,
+    avgIdleUsd: idleUsdSum / n,
   };
 }
 
@@ -342,6 +421,7 @@ function sample(strategy: GridStrategy, point: PricePoint): EquitySample {
   // Deliberately avoids getState(): it deep-copies the whole ledger, which
   // would make sampling O(n^2) over a long run and cripple the optimizer.
   const portfolioValue = strategy.getPortfolioValue(point.price);
+  const deployed = strategy.deployedCapital(point.price);
   const eth = strategy.ethBalance;
   const ethValue = eth * point.price;
   return {
@@ -351,6 +431,8 @@ function sample(strategy: GridStrategy, point: PricePoint): EquitySample {
     usdc: strategy.usdcBalance,
     eth,
     costBasisUsd: strategy.costBasisUsd(),
+    deployedUsd: deployed,
+    idleUsd: strategy.idleCapital(point.price, deployed),
     ethExposurePct: portfolioValue > 0 ? (ethValue / portfolioValue) * 100 : 0,
   };
 }

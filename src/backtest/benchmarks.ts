@@ -17,10 +17,12 @@ export interface Benchmark {
   finalEth: number;
   /** For LP: value lost vs HODL of the same deposit split (divergence/IL). */
   impermanentLossUsd?: number;
+  /** For LP: fee income earned over the period, when modeled. */
+  feeIncomeUsd?: number;
 }
 
 interface BenchInput {
-  prices: { timestamp: number; price: number }[];
+  prices: { timestamp: number; price: number; feeAprPct?: number; poolTvlUsd?: number }[];
   initialUsdc: number;
   initialEth: number;
 }
@@ -103,5 +105,92 @@ export function staticLpBenchmark({ prices, initialUsdc, initialEth }: BenchInpu
     finalUsdc: endHoldings.usdc,
     finalEth: endHoldings.eth,
     impermanentLossUsd: lpFinal - hodlExact,
+  };
+}
+
+const SECONDS_PER_YEAR = 365 * 24 * 3600;
+
+/**
+ * Passive V3 LP earning fees: the same capital deposited once into a range
+ * and left alone, collecting the pool's measured fee APR whenever price is
+ * inside that range.
+ *
+ * This is the benchmark that matters once fee income is modeled. If a
+ * do-nothing position in the same pool earns the same fees, the grid's
+ * trading, resets and inventory risk are pure overhead — so the strategy has
+ * to beat THIS, not just beat holding ETH.
+ *
+ * `rangePct` is the half-width of the position around the starting price.
+ * Fees compound into the position, matching the strategy's treatment.
+ *
+ * CAVEAT on range width: the pool's published APR is a pool average, and this
+ * applies it per dollar regardless of how wide the position is. Real V3
+ * concentration means a narrow position earns more per dollar than a wide one
+ * while in range, and less once out. Comparisons at MATCHED range width (say,
+ * against a grid using the same band) are therefore sound; comparing two
+ * different widths to each other overstates the wider one.
+ */
+export function passiveLpWithFeesBenchmark(
+  { prices, initialUsdc, initialEth }: BenchInput,
+  rangePct: number,
+): Benchmark {
+  const firstPrice = prices[0]!.price;
+  const capital = initialUsdc + initialEth * firstPrice;
+
+  const lo = firstPrice * (1 - rangePct / 100);
+  const hi = firstPrice * (1 + rangePct / 100);
+  const sqrtLo = Math.sqrt(lo);
+  const sqrtHi = Math.sqrt(hi);
+  const sqrtP0 = Math.sqrt(firstPrice);
+
+  const denom = sqrtP0 - sqrtLo + firstPrice * (1 / sqrtP0 - 1 / sqrtHi);
+  if (!(denom > 0)) throw new Error("invalid LP range");
+  const L = capital / denom;
+
+  function holdings(price: number): { eth: number; usdc: number } {
+    const sqrtP = Math.sqrt(Math.min(Math.max(price, lo), hi));
+    return {
+      eth: L * (1 / sqrtP - 1 / sqrtHi),
+      usdc: L * (sqrtP - sqrtLo),
+    };
+  }
+
+  // Fees accrue on the position's value while price is in range, at the
+  // pool's measured rate, and are held as cash alongside the position.
+  let feeIncome = 0;
+  for (let i = 1; i < prices.length; i++) {
+    const point = prices[i]!;
+    const apr = point.feeAprPct ?? 0;
+    if (apr <= 0) continue;
+    if (point.price < lo || point.price > hi) continue;
+
+    const elapsed = point.timestamp - prices[i - 1]!.timestamp;
+    if (elapsed <= 0) continue;
+
+    const h = holdings(point.price);
+    const positionValue = h.eth * point.price + h.usdc;
+    // Accrues on the position only: collected fees are loose tokens and
+    // provide no liquidity until re-deposited.
+    let income = positionValue * (apr / 100) * (elapsed / SECONDS_PER_YEAR);
+    // Same pro-rata dilution the strategy applies.
+    const tvl = point.poolTvlUsd ?? 0;
+    if (tvl > 0) income *= tvl / (positionValue + tvl);
+    feeIncome += income;
+  }
+
+  const lastPrice = prices[prices.length - 1]!.price;
+  const end = holdings(lastPrice);
+  const positionValue = end.eth * lastPrice + end.usdc;
+
+  const start = holdings(firstPrice);
+  const hodlExact = start.eth * lastPrice + start.usdc;
+
+  return {
+    name: `Passive V3 LP ±${rangePct.toFixed(0)}% (with fees)`,
+    finalValue: positionValue + feeIncome,
+    finalUsdc: end.usdc + feeIncome,
+    finalEth: end.eth,
+    impermanentLossUsd: positionValue - hodlExact,
+    feeIncomeUsd: feeIncome,
   };
 }

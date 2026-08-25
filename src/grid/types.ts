@@ -5,6 +5,26 @@
 
 export type Side = "BUY" | "SELL";
 
+/**
+ * How the strategy's capital reaches the market. This is not a presentation
+ * detail — it decides who pays the pool fee, and therefore what a fill costs.
+ *
+ * "taker"  The bot holds its balance in the wallet and market-swaps when a
+ *          level is crossed. It PAYS the pool fee plus slippage plus gas on
+ *          every fill, and earns no fee income. This is what the shipped
+ *          executor does.
+ *
+ * "lp"     The bot's capital is deposited as concentrated liquidity across the
+ *          band. When price crosses a level the AMM converts the position
+ *          automatically: the bot pays nothing, and the counterparty's fee
+ *          accrues to it pro rata. Only re-centring costs anything, because
+ *          that is a real burn + swap + mint.
+ *
+ * Charging per-fill swap costs while also crediting fee income puts the same
+ * dollar in both roles at once, which Uniswap does not permit.
+ */
+export type ExecutionMode = "taker" | "lp";
+
 export interface GridConfig {
   /** Starting USDC balance (quote asset). */
   initialUsdc: number;
@@ -18,7 +38,9 @@ export interface GridConfig {
   levelsBelow: number;
   /** Notional USD size of each grid order. */
   orderSizeUsd: number;
-  /** Swap fee modeled on every fill (basis points). */
+  /** How capital reaches the market; decides who pays the pool fee. */
+  executionMode: ExecutionMode;
+  /** Pool fee, in basis points. Paid on taker fills and on re-centring swaps. */
   feeBps: number;
   /** Slippage modeled on every fill (basis points). */
   slippageBps: number;
@@ -87,6 +109,12 @@ export interface GridConfig {
    */
   lpFeeAprPct: number;
   /**
+   * Band width at which the pool's published APR applies exactly. Narrower
+   * bands concentrate liquidity and earn more per dollar; wider ones less.
+   * 0 disables the adjustment (every width earns the pool average).
+   */
+  lpReferenceRangePct: number;
+  /**
    * Causal regime filter: when the trailing move over `regimeLookbackPoints`
    * observations exceeds this percentage in either direction, the grid resets
    * and stays down until the market calms. 0 (the default) disables it.
@@ -102,6 +130,58 @@ export interface GridConfig {
   volLookbackPoints: number;
   /** Rebuild only when per-observation realized volatility drops below this. */
   maxVolPerStep: number;
+  /**
+   * Price must close outside the reset band this many CONSECUTIVE extra
+   * observations before a reset triggers. 0 = trigger immediately (legacy).
+   * Filters whipsaw liquidations at local extremes.
+   */
+  resetConfirmObservations: number;
+  /**
+   * Postpone the reset liquidation while realized volatility exceeds
+   * maxVolPerStep (sell in calmer conditions), unless the hard-drawdown
+   * backstop is breached.
+   */
+  resetVolPostpone: boolean;
+  /**
+   * Backstop: force a FULL liquidation (ignoring confirmation, vol postpone,
+   * sell fraction and underwater carry) once portfolio drawdown from peak
+   * reaches this percent. 0 disables the backstop.
+   */
+  resetHardDrawdownPct: number;
+  /**
+   * Second backstop, measured on the INVENTORY rather than the portfolio:
+   * force a full liquidation once open inventory is underwater by more than
+   * this percent of its cost basis. 0 disables it.
+   *
+   * `resetHardDrawdownPct` alone cannot bind for this strategy. It compares
+   * total portfolio value against its peak, and the portfolio is mostly cash
+   * plus accumulated fee income, so a deeply underwater ETH position barely
+   * moves it — measured drawdown stays near 2% while the position itself is
+   * down 30%. Measuring the at-risk slice directly is what makes a backstop
+   * able to fire.
+   *
+   * Pairs with `resetUnderwaterSkipPct`: carry small losses, cut large ones.
+   */
+  resetHardInventoryLossPct: number;
+  /**
+   * Skip the post-reset cooldown when the reset had NO inventory to sell.
+   *
+   * The cooldown exists to avoid re-entering with capital at risk while the
+   * market is still violent. A reset that fired with a flat book realized
+   * nothing and de-risked nothing — it was a pure re-centring — so waiting
+   * afterwards protects nothing and only forfeits time in the market. Under
+   * the LP fee model that time is the single largest reset cost: fee income
+   * is rent for presence.
+   *
+   * Buys remain gated by the separate volatility control, which blocks
+   * accumulation into CHOPPY markets. Note that gate measures the std-dev of
+   * log returns, so a smooth one-way decline registers as low volatility and
+   * passes it: for that case the inventory ceiling (maxEthUsd) is the control,
+   * not the vol gate.
+   *
+   * false (the default) keeps the original unconditional cooldown.
+   */
+  resetSkipCooldownWhenFlat: boolean;
   /**
    * Circuit breaker: when this many resets happen within
    * resetBreakerWindowSeconds, the required cooldown doubles per extra batch.
@@ -164,7 +244,7 @@ export interface TradeRecord {
 
 export interface SkipRecord {
   side: Side;
-  reason: "no_usdc" | "max_eth" | "no_eth" | "min_eth" | "dust" | "high_vol";
+  reason: "no_usdc" | "max_eth" | "no_eth" | "min_eth" | "dust" | "high_vol" | "reset_postponed";
 }
 
 /**
@@ -211,7 +291,7 @@ export interface ResetRecord {
   /** ETH deliberately carried into the next grid instead of being sold. */
   ethCarried: number;
   /** Why the inventory was not fully liquidated, when it was not. */
-  carryReason: "NONE" | "PARTIAL_POLICY" | "UNDERWATER" | null;
+  carryReason: "NONE" | "PARTIAL_POLICY" | "UNDERWATER" | "HARD_STOP" | null;
   /** USDC actually received from the liquidation, after fees/slippage. */
   usdcRecovered: number;
   /** Inventory P&L at level prices: soldEth * price - costBasis. */
