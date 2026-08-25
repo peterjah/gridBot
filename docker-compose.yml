@@ -1,0 +1,63 @@
+services:
+  lpbot:
+    build: .
+    image: gridbot-lp:latest
+    container_name: lpbot
+    # The bot backs off internally on RPC failures; a restart here covers
+    # process-level death (OOM, host reboot). It stays stopped after an
+    # explicit `docker compose stop`.
+    restart: unless-stopped
+
+    # Secrets and endpoints come from .env — never baked into the image.
+    env_file: [.env]
+
+    environment:
+      MODE: lp-live
+      STATE_FILE: /app/state/position.json
+      LP_SEED_FILE: /app/state/seed-5m.csv
+
+      # --- safety: both must be set to broadcast -------------------------
+      DRY_RUN: "${DRY_RUN:-true}"
+      LIVE_CONFIRM: "${LIVE_CONFIRM:-}"
+
+      # --- strategy ------------------------------------------------------
+      LP_RANGE_PCT: "${LP_RANGE_PCT:-5}"
+      LP_RECENTER_BUFFER_PCT: "${LP_RECENTER_BUFFER_PCT:-50}"
+      LP_RECENTER_MIN_HOURS: "${LP_RECENTER_MIN_HOURS:-24}"
+      LP_SLIPPAGE_BPS: "${LP_SLIPPAGE_BPS:-50}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
+
+      # --- regime filter -------------------------------------------------
+      # Off by default. Walk-forward loses money in 3 of 4 out-of-sample folds
+      # without it; see docs/LP_REBALANCE.md before changing this.
+      REGIME_MAX_MOVE_PCT: "${REGIME_MAX_MOVE_PCT:-3}"
+      LP_REGIME_LOOKBACK_HOURS: "${LP_REGIME_LOOKBACK_HOURS:-168}"
+      LP_REGIME_SAMPLE_MINUTES: "${LP_REGIME_SAMPLE_MINUTES:-60}"
+      SEED_DAYS: "${SEED_DAYS:-30}"
+
+    volumes:
+      # Position id, fee totals and the regime price window. Losing this means
+      # losing track of the position and the whole fee measurement.
+      - lpbot-state:/app/state
+
+    # Logs go to the Docker daemon, readable with `docker compose logs -f`.
+    # Capped so an unattended run cannot fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    stop_grace_period: 30s
+
+    # The lock file exists only while the bot holds it, so it doubles as a
+    # liveness signal without adding an HTTP endpoint.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/state/position.json.lock || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  lpbot-state:

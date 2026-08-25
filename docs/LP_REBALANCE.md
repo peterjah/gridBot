@@ -247,7 +247,15 @@ only looks good on the windows it was not selected on.
 
 ## Running it
 
-Defaults to a dry run: every step is planned, quoted and logged, and nothing is
+Unattended, the Docker stack supervises the process and keeps logs in the
+Docker daemon (`docker compose logs -f`) rather than a file:
+
+```bash
+docker compose up -d
+```
+
+`./start.sh` runs the same bot in the foreground for development. Either way it
+defaults to a dry run: every step is planned, quoted and logged, and nothing is
 broadcast.
 
 Turn the regime filter on. It is off by default because it changes the

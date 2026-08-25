@@ -169,24 +169,58 @@ full analysis and the upgrade path to range orders.
 
 ## Running the LP bot
 
-`./start.sh` packages the whole launch: preflight checks, typecheck and tests,
-a fresh 5-minute data pull to seed the regime filter, a summary of what is
-about to run with the honest caveats, and the launch itself.
+### Docker (recommended for unattended operation)
+
+```bash
+cp .env.example .env      # set RPC_URL, POOL_ADDRESS, PRIVATE_KEY
+docker compose up -d      # start (dry run by default)
+docker compose logs -f    # follow — JSON lines, no log file involved
+docker compose stop       # stop
+docker compose down       # stop and remove the container (state survives)
+```
+
+State lives in the `lpbot-state` volume: the managed position id, the running
+fee total, and the regime price window. **Do not delete it** — `docker compose
+down -v` would, and the bot would lose track of its position and its whole fee
+measurement.
+
+Broadcasting requires **both** `DRY_RUN=false` and `LIVE_CONFIRM=yes` in
+`.env`. There is no prompt in a container, so setting both is the deliberate
+act of authorising real transactions; the entrypoint refuses to start with only
+one of them.
+
+Strategy parameters are environment variables, overridable in `.env`:
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `LP_RANGE_PCT` | 5 | band half-width, percent |
+| `LP_RECENTER_BUFFER_PCT` | 50 | re-centre trigger, % of half-width |
+| `REGIME_MAX_MOVE_PCT` | 3 | stand aside above this trailing move; 0 = off |
+| `LP_REGIME_LOOKBACK_HOURS` | 168 | regime lookback window |
+| `LP_RECENTER_MIN_HOURS` | 24 | minimum hours between re-centres |
+| `LP_SLIPPAGE_BPS` | 50 | slippage tolerance |
+
+The container fetches its regime seed data on every start, so the filter is
+active from the first cycle rather than blind for a week.
+
+### Foreground (development and dry runs)
+
+`./start.sh` runs the bot in the foreground with preflight checks, typecheck
+and tests, a fresh seed pull, and a summary of what is about to run:
 
 ```bash
 ./start.sh                 # dry run — plans and logs, broadcasts nothing
 ./start.sh --live          # broadcast (asks you to type "deploy")
+./start.sh --live --yes    # no prompt, for cron or systemd
 ./start.sh --help          # all options
 ```
 
 Defaults: ±5% band, re-centre beyond 50% of the half-width, regime filter on at
-3% over 168h, 24h between re-centres. Override with `--range`, `--buffer`,
-`--regime-move`, `--regime-hours`.
+3% over 168h, 24h between re-centres.
 
-It refuses to start without `RPC_URL` and `POOL_ADDRESS`, and without a key or
-wallet address. `--live` additionally requires `PRIVATE_KEY` and an interactive
-confirmation. See [docs/LP_REBALANCE.md](docs/LP_REBALANCE.md) before funding
-anything.
+Only one bot may run against a wallet at a time — a second one collides on
+nonces and fights over the position. Both entry points take an exclusive lock
+on `<STATE_FILE>.lock` and refuse to start if a live process holds it.
 
 ## Installation
 

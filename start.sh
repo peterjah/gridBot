@@ -8,7 +8,11 @@
 #   ./start.sh                        # dry run, default parameters
 #   ./start.sh --range 5 --buffer 50  # override strategy parameters
 #   ./start.sh --live                 # broadcast (interactive confirmation)
+#   ./start.sh --live --yes           # unattended (no confirmation prompt)
 #   ./start.sh --help
+#
+# For unattended operation prefer the Docker stack, which supervises the
+# process and gives you logs without a log file:  docker compose up -d
 #
 # The regime filter is ON by default here. Walk-forward says the strategy loses
 # money in 3 of 4 out-of-sample folds without it (docs/LP_REBALANCE.md).
@@ -31,12 +35,21 @@ SEED_CSV="data/lp-live-seed-5m.csv"
 LIVE=0
 DO_FETCH=1
 DO_CHECKS=1
+ASSUME_YES=0
 
 RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 info() { printf '%s==>%s %s\n' "$GRN" "$OFF" "$*"; }
 warn() { printf '%swarning:%s %s\n' "$YEL" "$OFF" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
+
+# Read .env without executing it: values may contain spaces or '#'.
+get_env() {
+  local key="$1"
+  if [ -n "${!key-}" ]; then printf '%s' "${!key}"; return; fi
+  [ -f .env ] || return 0
+  sed -n "s/^[[:space:]]*${key}=//p" .env | tail -n 1 | sed 's/[[:space:]]*$//'
+}
 
 usage() {
   sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -54,7 +67,18 @@ Options:
   --seed-days N          Days of 5m history to seed with.      (default 30)
   --no-fetch             Skip refreshing the seed data.
   --skip-checks          Skip typecheck and tests.
+  --yes                  Skip the interactive confirmation. Required with
+                         --live when there is no terminal (cron, systemd, CI).
   -h, --help             This message.
+
+This script runs the bot in the FOREGROUND. For unattended operation use the
+Docker stack instead: it supervises the process, keeps state in a volume, and
+gives you logs without a log file.
+
+  cp .env.example .env      # set RPC_URL, POOL_ADDRESS, PRIVATE_KEY
+  docker compose up -d      # start
+  docker compose logs -f    # follow
+  docker compose stop       # stop
 USAGE
 }
 
@@ -72,6 +96,7 @@ while [ $# -gt 0 ]; do
     --seed-days)      SEED_DAYS="${2:?--seed-days needs a value}"; shift 2 ;;
     --no-fetch)       DO_FETCH=0; shift ;;
     --skip-checks)    DO_CHECKS=0; shift ;;
+    --yes|-y)         ASSUME_YES=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                die "unknown option: $1  (try --help)" ;;
   esac
@@ -88,19 +113,12 @@ say "  node $(node -v)"
 [ -d node_modules ] || { info "Installing dependencies"; npm install; }
 [ -f .env ] || die ".env not found. Copy .env.example to .env and fill it in."
 
-# Read .env without executing it: values may contain spaces or '#'.
-get_env() {
-  local key="$1"
-  if [ -n "${!key-}" ]; then printf '%s' "${!key}"; return; fi
-  sed -n "s/^[[:space:]]*${key}=//p" .env | tail -n 1 | sed 's/[[:space:]]*$//'
-}
-
+STATE_FILE_V="$(get_env STATE_FILE)"
+[ -n "$STATE_FILE_V" ] || STATE_FILE_V="state/position.json"
 RPC_URL_V="$(get_env RPC_URL)"
 POOL_ADDRESS_V="$(get_env POOL_ADDRESS)"
 PRIVATE_KEY_V="$(get_env PRIVATE_KEY)"
 WALLET_ADDRESS_V="$(get_env WALLET_ADDRESS)"
-STATE_FILE_V="$(get_env STATE_FILE)"
-[ -n "$STATE_FILE_V" ] || STATE_FILE_V="state/position.json"
 
 [ -n "$RPC_URL_V" ]      || die "RPC_URL is not set in .env"
 [ -n "$POOL_ADDRESS_V" ] || die "POOL_ADDRESS is not set in .env"
@@ -204,12 +222,15 @@ cat <<PLAN
 PLAN
 
 if [ "$LIVE" -eq 1 ]; then
-  if [ ! -t 0 ]; then
-    die "--live needs an interactive terminal for confirmation"
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    warn "--yes given: broadcasting real transactions without confirmation"
+  elif [ ! -t 0 ]; then
+    die "--live has no terminal to confirm at. Pass --yes to run unattended."
+  else
+    printf 'Type %sdeploy%s to broadcast real transactions: ' "$RED" "$OFF"
+    read -r REPLY_TEXT
+    [ "$REPLY_TEXT" = "deploy" ] || die "aborted"
   fi
-  printf 'Type %sdeploy%s to broadcast real transactions: ' "$RED" "$OFF"
-  read -r REPLY_TEXT
-  [ "$REPLY_TEXT" = "deploy" ] || die "aborted"
 fi
 
 # ------------------------------------------------------------------ launch ---

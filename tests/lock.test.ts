@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { acquireLock } from "../src/bot/lock.js";
 
 const dirs: string[] = [];
@@ -41,14 +42,67 @@ describe("single-instance lock", () => {
 
   it("reclaims a lock left by a dead process", () => {
     const p = statePath();
-    // PID 2^22 is above the default Linux/macOS pid_max, so it cannot exist.
+    // Use a pid that genuinely existed and has exited. Picking a large
+    // constant is not portable: Linux allows pid_max up to 4194304, so a
+    // "surely impossible" pid can be a live process there.
+    const dead = spawnSync(process.execPath, ["-e", ""]);
+    expect(dead.pid).toBeGreaterThan(0);
     writeFileSync(
       `${p}.lock`,
-      JSON.stringify({ pid: 4_194_303, startedAt: "2020-01-01T00:00:00Z", stateFile: p }),
+      JSON.stringify({ pid: dead.pid, startedAt: "2020-01-01T00:00:00Z", stateFile: p }),
     );
     const lock = acquireLock(p);
     expect(JSON.parse(readFileSync(`${p}.lock`, "utf8")).pid).toBe(process.pid);
     lock.release();
+  });
+
+  /**
+   * In a container the bot is pid 1. A lock left by a killed container names
+   * pid 1, and the next container's pid 1 is alive — without a start-time
+   * check the bot would refuse to start forever.
+   */
+  it("reclaims a lock whose pid was reused by a different process", () => {
+    const p = statePath();
+    writeFileSync(
+      `${p}.lock`,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: "2020-01-01T00:00:00Z",
+        stateFile: p,
+        // This process is alive, but it did not start at tick 1.
+        startTime: 1,
+        host: "some-dead-container",
+      }),
+    );
+    if (process.platform === "linux") {
+      const lock = acquireLock(p);
+      expect(JSON.parse(readFileSync(`${p}.lock`, "utf8")).pid).toBe(process.pid);
+      lock.release();
+    } else {
+      // No /proc: the check degrades to pid-only and correctly refuses.
+      expect(() => acquireLock(p)).toThrow(/Another instance is already running/);
+    }
+  });
+
+  it("records a start time on Linux so pids can be told apart", () => {
+    const p = statePath();
+    const lock = acquireLock(p);
+    const body = JSON.parse(readFileSync(`${p}.lock`, "utf8"));
+    expect(body.host).toBeTruthy();
+    if (process.platform === "linux") {
+      expect(typeof body.startTime).toBe("number");
+    }
+    lock.release();
+  });
+
+  it("rejects a nonsensical pid rather than trusting it", () => {
+    const p = statePath();
+    for (const pid of [0, -1, 1.5]) {
+      writeFileSync(`${p}.lock`, JSON.stringify({ pid, startedAt: "x", stateFile: p }));
+      const lock = acquireLock(p);
+      expect(JSON.parse(readFileSync(`${p}.lock`, "utf8")).pid).toBe(process.pid);
+      lock.release();
+    }
   });
 
   it("reclaims an unreadable lock", () => {
