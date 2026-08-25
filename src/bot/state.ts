@@ -36,6 +36,16 @@ export interface BotState {
   parked: boolean;
   /** Unix seconds of the last park/unpark transition. */
   lastParkChangeAt: number;
+  /**
+   * Unix seconds of the last successful re-centre.
+   *
+   * Persisted because the re-centre cooldown exists to stop churn: keeping it
+   * in memory alone would let a crash/restart loop re-centre on every cycle
+   * and burn the position down in gas and swap costs.
+   */
+  lastRecenterAt: number;
+  /** Observability mirror of the short hedge; the chain (debt balance) decides. */
+  hedged: boolean;
 }
 
 export interface PriceSample {
@@ -56,6 +66,8 @@ export function emptyState(): BotState {
     priceHistory: [],
     parked: false,
     lastParkChangeAt: 0,
+    lastRecenterAt: 0,
+    hedged: false,
   };
 }
 
@@ -134,6 +146,28 @@ export function recordFees(
   state.recenters += 1;
   saveState(stateFile, state);
   return state;
+}
+
+/**
+ * Persist the time of a successful re-centre.
+ *
+ * The cooldown must survive restarts: an in-memory-only timestamp resets on
+ * crash, and a bot stuck in a restart loop would then re-centre every cycle,
+ * which is exactly the churn the cooldown exists to prevent. Dry runs change
+ * nothing on-chain, so callers must not invoke this for them.
+ */
+export function markRecentred(stateFile: string, atSeconds = Math.floor(Date.now() / 1000)): void {
+  const state = loadState(stateFile);
+  state.lastRecenterAt = atSeconds;
+  saveState(stateFile, state);
+}
+
+/** Persist the hedge observability flag (the chain decides, this only logs). */
+export function saveHedgedFlag(stateFile: string, hedged: boolean): void {
+  const state = loadState(stateFile);
+  if (state.hedged === hedged) return;
+  state.hedged = hedged;
+  saveState(stateFile, state);
 }
 
 /**

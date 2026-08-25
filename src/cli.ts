@@ -54,10 +54,16 @@ import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
  *   --lp-recenter-hours 24  minimum hours between re-centres
  *   --lp-slippage-bps 50    slippage tolerance on the rebalancing swap and mint
  *   --lp-regime-move 0      stand aside above this trailing move % (0 = off)
+ *   --lp-regime-reenter-margin 25  hysteresis: re-enter only below
+ *                           (1 - margin/100) x the exit threshold
  *   --lp-regime-hours 168   lookback window for the regime filter, hours
  *   --lp-seed-file path     price CSV used to pre-fill the regime window
  *                        (omit to start blind; never defaults to CSV_FILE)
  *   --position-id 0         position NFT to manage (0 = mint a fresh one)
+ *   --hedge false           short ETH with borrowed Aave WETH while parked
+ *                           (needs ENABLE_AAVE=true)
+ *   --hedge-ratio 50        percent of ETH exposure to short while parked
+ *   --hedge-max-ltv 40      safety cap on borrowed value vs collateral, %
  *   --state-file path       where the managed token id is persisted
  *   --dry-run false         actually broadcast (also needs LIVE_CONFIRM=yes)
  *   --log path           paper log file for soak-report
@@ -340,6 +346,13 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   }
   if (args["lp-slippage-bps"] !== undefined) lpr.slippageBps = Number(args["lp-slippage-bps"]);
   if (args["lp-regime-move"] !== undefined) lpr.regimeMaxMovePct = Number(args["lp-regime-move"]);
+  if (args["lp-regime-reenter-margin"] !== undefined) {
+    const margin = Number(args["lp-regime-reenter-margin"]);
+    if (!Number.isFinite(margin) || margin < 0 || margin >= 100) {
+      throw new Error("--lp-regime-reenter-margin must be a percent in [0,100)");
+    }
+    lpr.regimeReenterMarginPct = margin;
+  }
   if (args["lp-regime-hours"] !== undefined) {
     lpr.regimeLookbackHours = Number(args["lp-regime-hours"]);
   }
@@ -349,6 +362,23 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   if (args["position-id"] !== undefined) lpr.positionId = BigInt(args["position-id"]);
   if (args["state-file"] !== undefined) lpr.stateFile = args["state-file"];
   if (args["dry-run"] !== undefined) lpr.dryRun = args["dry-run"] !== "false";
+
+  // Short hedge while parked (requires ENABLE_AAVE=true).
+  if (args["hedge"] !== undefined) cfg.hedgeEnabled = args["hedge"] !== "false";
+  if (args["hedge-ratio"] !== undefined) {
+    const ratio = Number(args["hedge-ratio"]);
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 100) {
+      throw new Error("--hedge-ratio must be a percent in (0,100]");
+    }
+    cfg.hedgeRatioPct = ratio;
+  }
+  if (args["hedge-max-ltv"] !== undefined) {
+    const ltv = Number(args["hedge-max-ltv"]);
+    if (!Number.isFinite(ltv) || ltv <= 0 || ltv >= 100) {
+      throw new Error("--hedge-max-ltv must be a percent in (0,100)");
+    }
+    cfg.hedgeMaxLtvPct = ltv;
+  }
 
   // A named configuration overrides the individual flags above.
   if (args["config"] !== undefined) applyNamedConfig(cfg, args["config"]);

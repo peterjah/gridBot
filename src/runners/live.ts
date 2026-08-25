@@ -42,12 +42,14 @@ export async function runLiveMode(cfg: AppConfig): Promise<void> {
         {
           underlying: pool.token1.address,
           aToken: cfg.aUsdc,
+          debtToken: cfg.variableDebtUsdc,
           decimals: pool.token1.decimals,
           symbol: pool.token1.symbol,
         },
         {
           underlying: pool.token0.address,
           aToken: cfg.aWeth,
+          debtToken: cfg.variableDebtWeth,
           decimals: pool.token0.decimals,
           symbol: pool.token0.symbol,
         },

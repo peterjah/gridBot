@@ -233,6 +233,43 @@ One further caution: the sweep will not choose this for you. Ranked by RETURN,
 training window is a bull market where standing aside costs return. The filter
 only looks good on the windows it was not selected on.
 
+### Hysteresis on re-entry (`LP_REGIME_REENTER_MARGIN_PCT`)
+
+Re-entering the instant |move| dips back under the exit threshold flips
+park/deploy on every oscillation around it, and each flip pays a full sell +
+buy-back spread plus gas. With `--lp-regime-reenter-margin 25` (default) the
+bot exits above 3% but only re-enters below 2.25%. Set `0` for symmetric
+behaviour. The margin trades a little late re-entry for far fewer whipsaw
+cycles; there is no measurement behind the default, so treat it like every
+other unvalidated parameter here.
+
+### Short hedge while parked (`HEDGE_ENABLED`)
+
+The filter's documented failure mode is directional: out-of-sample losses track
+ETH, and going to cash merely stops paying for the move. While parked, the bot
+can instead **short** it:
+
+1. `parkIdle` supplies idle USDC/WETH to Aave (collateral);
+2. the hedge borrows WETH against that collateral and sells it for USDC;
+3. on re-entry it buys the WETH back and repays before anything deploys.
+
+The parked book then holds roughly zero ETH delta instead of merely being
+uninvested — fold 1/2-style drawdowns become flat-to-positive, at the cost of
+variable borrow-rate carry and two swap legs per park/unpark cycle. The chain
+decides whether a hedge exists (the variableDebtToken balance), so a crash
+mid-unwind recovers by simply running the next cycle.
+
+```bash
+HEDGE_ENABLED=true HEDGE_RATIO_PCT=50 HEDGE_MAX_LTV_PCT=40 npm run lp-live -- \
+  --lp-regime-move 3 --lp-regime-hours 168
+```
+
+`HEDGE_RATIO_PCT` is the share of ETH exposure to short (100 = fully neutral
+while parked); `HEDGE_MAX_LTV_PCT` is a hard safety cap well below Aave's
+liquidation LTV — the borrow is min(ratio target, this capacity). Requires
+`ENABLE_AAVE=true`. Nothing about this is validated by the backtests; measure
+live before trusting it.
+
 ## Still not validated
 
 1. **The fee model is optimistic where it matters most.** No re-centring

@@ -8,6 +8,7 @@ import { getPosition } from "../uniswap/position.js";
 import {
   loadPositionId,
   loadState,
+  markRecentred,
   recordPriceSample,
   saveState,
   trailingMovePct,
@@ -15,6 +16,7 @@ import {
 import type { Strategy } from "../strategy/rebalance.js";
 import { RebalanceExecutor } from "./rebalanceExecutor.js";
 import type { LpLendingManager } from "../lp/lpLending.js";
+import type { AaveShortHedge } from "../lp/hedge.js";
 import { sqrtRatioToPrice } from "../utils/math.js";
 import { logger } from "../utils/logger.js";
 
@@ -23,7 +25,7 @@ const MAX_BACKOFF_SECONDS = 900;
 export class Monitor {
   private readonly executor: RebalanceExecutor;
   private consecutiveFailures = 0;
-  private lastRecenterAt = 0;
+  private lastRecenterAt: number;
 
   constructor(
     private readonly client: BotClient,
@@ -35,6 +37,8 @@ export class Monitor {
     private readonly strategy: Strategy,
     /** Optional: lends idle capital while the bot stands aside. */
     private readonly lending: LpLendingManager | null = null,
+    /** Optional: shorts ETH with borrowed Aave WETH while parked. */
+    private readonly hedge: AaveShortHedge | null = null,
   ) {
     this.executor = new RebalanceExecutor(
       client,
@@ -44,6 +48,9 @@ export class Monitor {
       pool,
       strategy,
     );
+    // The cooldown survives restarts: seeding from the persisted timestamp
+    // stops a crash/restart loop from re-centring on every cycle.
+    this.lastRecenterAt = loadState(config.stateFile).lastRecenterAt * 1000;
   }
 
   private get wallet(): Address {
@@ -76,9 +83,16 @@ export class Monitor {
       wallet: this.wallet,
       regimeFilter:
         this.config.regimeMaxMovePct > 0
-          ? `stand aside above ${this.config.regimeMaxMovePct}% over ${this.config.regimeLookbackHours}h`
+          ? `stand aside above ${this.config.regimeMaxMovePct}% over ${this.config.regimeLookbackHours}h` +
+            (this.config.regimeReenterMarginPct > 0
+              ? `, re-enter below ${(
+                  this.config.regimeMaxMovePct *
+                  (1 - this.config.regimeReenterMarginPct / 100)
+                ).toFixed(2)}%`
+              : "")
           : "off",
       lending: this.lending !== null ? "Aave V3 while standing aside" : "off",
+      hedge: this.hedge !== null ? "borrowed-WETH short while parked" : "off",
     });
 
     for (;;) {
@@ -220,6 +234,7 @@ export class Monitor {
       // Idle capital earns nothing, and the filter is deliberately idle most
       // of the time. Run this on every hostile cycle, not just the one that
       // closes the position, so a deposit arriving mid-park is picked up too.
+      // This also supplies the COLLATERAL the hedge borrows against.
       if (this.lending !== null) {
         try {
           await this.lending.parkIdle(price);
@@ -230,15 +245,45 @@ export class Monitor {
           });
         }
       }
+
+      // Parked cash tracks ETH down instead of merely missing it. Like the
+      // lending above this is an optimisation on top of the risk control: a
+      // failed hedge logs and retries next cycle, it never blocks parking.
+      if (this.hedge !== null) {
+        try {
+          await this.hedge.open(price);
+        } catch (error) {
+          logger.warn("Could not open short hedge", {
+            error: error instanceof Error ? error.message.split("\n")[0] : String(error),
+          });
+        }
+      }
       return;
     }
 
     // Calm again: clear the parked flag so re-entry can proceed below.
     if (persisted.parked && filterOn) {
+      // Hysteresis: re-entry requires a SMALLER move than exit. Re-entering
+      // the instant |move| dips under the exit threshold flips park/deploy on
+      // every oscillation around it, paying a full sell + buy-back each time.
+      const reenterMaxPct =
+        this.config.regimeMaxMovePct * (1 - this.config.regimeReenterMarginPct / 100);
+      // Insufficient history is not evidence of a big move — same convention
+      // as the exit path, which stays invested until the window fills.
+      const calmEnough = move === null || Math.abs(move) <= reenterMaxPct;
       if (!dwelled) {
         logger.info("Regime calm but dwell time not elapsed — staying in cash", {
           recenterMinHours: this.config.recenterMinHours,
         });
+        await this.stayParked(price);
+        return;
+      }
+      if (!calmEnough) {
+        logger.info("Regime cooling but move still above re-entry threshold — staying in cash", {
+          trailingMovePct: move === null ? null : Number(move.toFixed(2)),
+          reenterBelowPct: Number(reenterMaxPct.toFixed(2)),
+        });
+        await this.stayParked(price);
         return;
       }
       logger.info("Regime calm — re-entering", {
@@ -268,6 +313,14 @@ export class Monitor {
       return;
     }
 
+    // Unwind BEFORE anything else touches balances. The buy-back needs free
+    // wallet USDC and deployment must never be funded from a wallet that also
+    // owes WETH. Errors propagate: deploying long while still short is worse
+    // than a delayed entry.
+    if (this.hedge !== null && (await this.hedge.isOpen())) {
+      await this.hedge.close();
+    }
+
     // Withdraw before anything reads a balance. The rebalance plan sizes the
     // position from the wallet, so deploying first would fund it from the
     // un-lent remainder and quietly leave the rest in Aave.
@@ -283,7 +336,26 @@ export class Monitor {
     await this.executor.rebalance(position, state.sqrtPriceX96, state.currentTick);
     // A dry run changes nothing on-chain, so it must not start the cooldown —
     // otherwise the planner goes quiet for `recenterMinHours` after one cycle.
-    if (!this.config.dryRun) this.lastRecenterAt = Date.now();
+    if (!this.config.dryRun) {
+      this.lastRecenterAt = Date.now();
+      markRecentred(this.config.stateFile);
+    }
+  }
+
+  /**
+   * Lend whatever is idle while staying parked for another cycle (dwell or
+   * hysteresis hold). Same non-fatal treatment as the hostile branch: yield
+   * must never break the risk control.
+   */
+  private async stayParked(price: number): Promise<void> {
+    if (this.lending === null) return;
+    try {
+      await this.lending.parkIdle(price);
+    } catch (error) {
+      logger.warn("Could not supply idle balance to Aave", {
+        error: error instanceof Error ? error.message.split("\n")[0] : String(error),
+      });
+    }
   }
 
   /**

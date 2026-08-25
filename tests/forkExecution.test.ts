@@ -84,6 +84,7 @@ describe.runIf(FORK_URL)("fork execution", () => {
         regimeMaxMovePct: 0,
         regimeLookbackHours: 168,
         regimeSampleMinutes: 60,
+        regimeReenterMarginPct: 25,
         seedFile: null,
       },
       resultsDir: "results",
@@ -146,12 +147,17 @@ describe.runIf(FORK_URL)("fork execution", () => {
       },
             lendingEnabled: true,
       aavePool: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
-      aUsdc: "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB",
-      aWeth: "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7",
+     aUsdc: "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB",
+     aWeth: "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7",
+     variableDebtUsdc: "0x59dca05b6c26dbd64b5381374aAaC5CD05644C28",
+     variableDebtWeth: "0x24e6e0795b3c7c71D965fCc4f371803d1c1DcA1E",
       lendBufferUsdcUsd: 0,
       lendBufferEth: 0,
       lendMinActionUsd: 100,
       lendIntervalSeconds: 3600,
+      hedgeEnabled: false,
+      hedgeRatioPct: 50,
+      hedgeMaxLtvPct: 40,
       soakLogFile: "",
       soakDays: 0,
     };
@@ -159,8 +165,8 @@ describe.runIf(FORK_URL)("fork execution", () => {
     aave = new AaveExecutor(
       client,
       cfg,
-      { underlying: pool.token1.address, aToken: cfg.aUsdc, decimals: pool.token1.decimals, symbol: pool.token1.symbol },
-      { underlying: pool.token0.address, aToken: cfg.aWeth, decimals: pool.token0.decimals, symbol: pool.token0.symbol },
+      { underlying: pool.token1.address, aToken: cfg.aUsdc, debtToken: cfg.variableDebtUsdc, decimals: pool.token1.decimals, symbol: pool.token1.symbol },
+      { underlying: pool.token0.address, aToken: cfg.aWeth, debtToken: cfg.variableDebtWeth, decimals: pool.token0.decimals, symbol: pool.token0.symbol },
       TEST_KEY,
     );
     executor = new UniswapV3Executor(client, cfg, pool, TEST_KEY);

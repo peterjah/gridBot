@@ -7,6 +7,7 @@ import { ensureStateDir, loadState, saveState, seedPriceHistory } from "../bot/s
 import { acquireLock } from "../bot/lock.js";
 import { AaveExecutor } from "../lending/aaveExecutor.js";
 import { LpLendingManager } from "../lp/lpLending.js";
+import { AaveShortHedge } from "../lp/hedge.js";
 import { loadPrices } from "./backtest.js";
 import type { AppConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -141,6 +142,7 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
   // most of the time at the settings that help. Lending it recovers part of
   // that; everything is withdrawn before the bot deploys.
   let lending: LpLendingManager | null = null;
+  let hedge: AaveShortHedge | null = null;
   if (cfg.lendingEnabled) {
     if (!cfg.privateKey && !lp.dryRun) {
       throw new Error("ENABLE_AAVE=true needs PRIVATE_KEY to supply or withdraw");
@@ -151,12 +153,14 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
       {
         underlying: pool.token1.address,
         aToken: cfg.aUsdc,
+        debtToken: cfg.variableDebtUsdc,
         decimals: pool.token1.decimals,
         symbol: pool.token1.symbol,
       },
       {
         underlying: pool.token0.address,
         aToken: cfg.aWeth,
+        debtToken: cfg.variableDebtWeth,
         decimals: pool.token0.decimals,
         symbol: pool.token0.symbol,
       },
@@ -169,9 +173,24 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
       minActionUsd: cfg.lendMinActionUsd,
       dryRun: lp.dryRun,
     });
+    if (cfg.hedgeEnabled) {
+      if (lp.regimeMaxMovePct <= 0) {
+        logger.warn(
+          "HEDGE_ENABLED=true but the regime filter is off — there is no park to " +
+            "hedge. The short will never open.",
+        );
+      }
+      hedge = new AaveShortHedge(aave, client, transactor, lp, pool, {
+        ratioPct: cfg.hedgeRatioPct,
+        maxLtvPct: cfg.hedgeMaxLtvPct,
+        minActionUsd: cfg.lendMinActionUsd,
+        dryRun: lp.dryRun,
+      }, cfg.walletAddress);
+    }
     logger.info("Aave lending enabled for idle capital", {
       pool: cfg.aavePool,
       minActionUsd: cfg.lendMinActionUsd,
+      hedge: hedge !== null ? `${cfg.hedgeRatioPct}% of ETH exposure` : "off",
     });
   }
 
@@ -184,6 +203,7 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
     pool,
     strategy,
     lending,
+    hedge,
   );
   await monitor.run();
 }

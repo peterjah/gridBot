@@ -127,6 +127,15 @@ export interface LpRebalanceConfig {
    */
   regimeMaxMovePct: number;
   /**
+   * Hysteresis on re-entry, percent of `regimeMaxMovePct`.
+   *
+   * The filter EXITS when |move| > regimeMaxMovePct but only RE-ENTERS when
+   * |move| < regimeMaxMovePct * (1 - margin/100). Without the gap the bot
+   * flips park/deploy on every oscillation around the threshold, paying a
+   * full sell + buy-back spread each flip. 0 restores symmetric behaviour.
+   */
+  regimeReenterMarginPct: number;
+  /**
    * Lookback window in HOURS. The backtest expresses this in observations,
    * which depends on the data resolution: 2016 observations of 5-minute data
    * is 168 hours.
@@ -199,10 +208,25 @@ export interface AppConfig {
   aavePool: `0x${string}`;
   aUsdc: `0x${string}`;
   aWeth: `0x${string}`;
+  variableDebtUsdc: `0x${string}`;
+  variableDebtWeth: `0x${string}`;
   lendBufferUsdcUsd: number;
   lendBufferEth: number;
   lendMinActionUsd: number;
   lendIntervalSeconds: number;
+
+  // --- Short hedge while parked (requires lendingEnabled) ---
+  /**
+   * When the regime filter parks, borrow WETH against the supplied collateral
+   * and sell it, so parked capital is flat against ETH instead of merely
+   * uninvested. Off by default: it adds borrow-rate carry and two swap legs
+   * per park/unpark cycle.
+   */
+  hedgeEnabled: boolean;
+  /** Percent of the ETH-side exposure to short. */
+  hedgeRatioPct: number;
+  /** Hard safety cap on borrowed value vs supplied collateral, percent. */
+  hedgeMaxLtvPct: number;
 
   // --- soak reporting ---
   soakLogFile: string;
@@ -316,12 +340,19 @@ export function loadConfig(mode: Mode): AppConfig {
     aavePool: contracts.aavePool,
     aUsdc: (env("A_USDC") ?? "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB") as `0x${string}`,
     aWeth: (env("A_WETH") ?? "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7") as `0x${string}`,
+    variableDebtUsdc: (env("VARIABLE_DEBT_USDC") ??
+      "0x59dca05b6c26dbd64b5381374aAaC5CD05644C28") as `0x${string}`,
+    variableDebtWeth: (env("VARIABLE_DEBT_WETH") ??
+      "0x24e6e0795b3c7c71D965fCc4f371803d1c1DcA1E") as `0x${string}`,
     // Buffers default to ZERO: all idle assets are lent. Grid fills
     // auto-withdraw any shortfall from Aave just-in-time instead.
     lendBufferUsdcUsd: num("LEND_BUFFER_USDC", 0),
     lendBufferEth: num("LEND_BUFFER_ETH", 0),
     lendMinActionUsd: num("LEND_MIN_ACTION_USD", 100),
     lendIntervalSeconds: num("LEND_INTERVAL_SECONDS", 3600),
+    hedgeEnabled: bool("HEDGE_ENABLED", false),
+    hedgeRatioPct: num("HEDGE_RATIO_PCT", 50),
+    hedgeMaxLtvPct: num("HEDGE_MAX_LTV_PCT", 40),
     soakLogFile: env("SOAK_LOG_FILE") ?? "paper.log",
     soakDays: Math.trunc(num("SOAK_DAYS", 0)),
     grid: {
@@ -396,6 +427,7 @@ export function loadConfig(mode: Mode): AppConfig {
         stateFile: env("STATE_FILE") ?? "state/position.json",
         dryRun: bool("DRY_RUN", true),
         regimeMaxMovePct: num("REGIME_MAX_MOVE_PCT", 0),
+        regimeReenterMarginPct: num("LP_REGIME_REENTER_MARGIN_PCT", 25),
         regimeLookbackHours: num("LP_REGIME_LOOKBACK_HOURS", 168),
         regimeSampleMinutes: num("LP_REGIME_SAMPLE_MINUTES", 60),
         seedFile: env("LP_SEED_FILE") ?? null,

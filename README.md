@@ -204,9 +204,13 @@ Strategy parameters are environment variables, overridable in `.env`:
 | `LP_RANGE_PCT` | 5 | band half-width, percent |
 | `LP_RECENTER_BUFFER_PCT` | 50 | re-centre trigger, % of half-width |
 | `REGIME_MAX_MOVE_PCT` | 3 | stand aside above this trailing move; 0 = off |
+| `LP_REGIME_REENTER_MARGIN_PCT` | 25 | hysteresis: re-enter only below (1 − margin/100) × the exit threshold |
 | `LP_REGIME_LOOKBACK_HOURS` | 168 | regime lookback window |
 | `LP_RECENTER_MIN_HOURS` | 24 | minimum hours between re-centres |
 | `LP_SLIPPAGE_BPS` | 50 | slippage tolerance |
+| `HEDGE_ENABLED` | false | short ETH with borrowed Aave WETH while parked (needs `ENABLE_AAVE=true`) |
+| `HEDGE_RATIO_PCT` | 50 | percent of ETH exposure to short |
+| `HEDGE_MAX_LTV_PCT` | 40 | safety cap on borrowed value vs collateral |
 
 The container fetches its regime seed data on every start, so the filter is
 active from the first cycle rather than blind for a week.

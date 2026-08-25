@@ -20,6 +20,7 @@ const baseCfg = {
   regimeMaxMovePct: 0,
   regimeLookbackHours: 168,
   regimeSampleMinutes: 60,
+  regimeReenterMarginPct: 25,
   seedFile: null,
 } satisfies LpRebalanceConfig;
 
