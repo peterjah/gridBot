@@ -25,6 +25,7 @@ const options: LpWalkForwardOptions = {
     recenterBuffers: [0, 50],
     recenterMinHours: [24],
     regimeMaxMovePcts: [0],
+    hedgeRatioPcts: [0],
   },
   metric: "RETURN",
   input: {
@@ -36,6 +37,9 @@ const options: LpWalkForwardOptions = {
       referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
     },
     gas: 0.02,
   },

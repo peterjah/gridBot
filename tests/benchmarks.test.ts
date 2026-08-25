@@ -165,6 +165,9 @@ describe("passive LP concentration", () => {
           referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
         },
         flat(2000, 20),
       ).feeIncomeUsd;
@@ -186,6 +189,9 @@ describe("passive LP concentration", () => {
         referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
       },
       flat(3000, 30),
     );
@@ -245,6 +251,9 @@ describe("density-based fee share", () => {
         referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
       },
       prices,
     );
@@ -271,6 +280,9 @@ describe("fee income does not compound into liquidity", () => {
           referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
         },
         Array.from({ length: hours + 1 }, (_, i) => ({
           timestamp: 1_700_000_000 + i * 3600,
@@ -310,6 +322,9 @@ describe("fee compounding at re-centring", () => {
           feeBps: 5, slippageBps: 3, recenterMinHours: 24, referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
         },
         flat(hours + 1, 100),
       ).feeIncomeUsd;
@@ -331,6 +346,9 @@ describe("fee compounding at re-centring", () => {
         feeBps: 5, slippageBps: 3, recenterMinHours: 1, referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
       },
       data,
     );
@@ -356,6 +374,9 @@ describe("fee attribution survives redeployment", () => {
         feeBps: 5, slippageBps: 3, recenterMinHours: 1, referenceRangePct: 25,
       regimeMaxMovePct: 0,
       regimeLookbackPoints: 288,
+      hedgeRatioPct: 0,
+      hedgeBorrowAprPct: 3,
+      hedgeWhileParkedOnly: false,
       },
       data,
     );

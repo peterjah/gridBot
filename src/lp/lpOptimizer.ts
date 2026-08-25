@@ -22,6 +22,8 @@ export interface LpAxes {
    * money out of sample, so this is the axis that matters most.
    */
   regimeMaxMovePcts: number[];
+  /** Short ratios to try, percent of ETH exposure. 0 = unhedged. */
+  hedgeRatioPcts: number[];
 }
 
 export const DEFAULT_LP_AXES: LpAxes = {
@@ -29,6 +31,7 @@ export const DEFAULT_LP_AXES: LpAxes = {
   recenterBuffers: [0, 10, 25, 50, 100],
   recenterMinHours: [24],
   regimeMaxMovePcts: [0],
+  hedgeRatioPcts: [0],
 };
 
 export interface LpMetrics {
@@ -36,6 +39,7 @@ export interface LpMetrics {
   recenterBufferPct: number;
   recenterMinHours: number;
   regimeMaxMovePct: number;
+  hedgeRatioPct: number;
   finalValue: number;
   returnPct: number;
   maxDrawdownPct: number;
@@ -47,6 +51,8 @@ export interface LpMetrics {
   timeInRangePct: number;
   timeParkedPct: number;
   parkEvents: number;
+  hedgePnlUsd: number;
+  hedgeCostUsd: number;
   impermanentLossUsd: number;
   riskAdjusted: number;
 }
@@ -68,6 +74,7 @@ export function evaluateLp(
   recenterMinHours: number,
   input: LpEvalInput,
   regimeMaxMovePct?: number,
+  hedgeRatioPct?: number,
 ): LpMetrics {
   const cfg: PassiveLpConfig = {
     ...input.base,
@@ -75,6 +82,7 @@ export function evaluateLp(
     recenterBufferPct,
     recenterMinHours,
     ...(regimeMaxMovePct === undefined ? {} : { regimeMaxMovePct }),
+    ...(hedgeRatioPct === undefined ? {} : { hedgeRatioPct }),
   };
   const result = runPassiveLp(cfg, input.prices, input.gas);
   assertLpReconciles(result);
@@ -87,6 +95,7 @@ export function metricsOf(r: PassiveLpResult): LpMetrics {
     recenterBufferPct: r.config.recenterBufferPct,
     recenterMinHours: r.config.recenterMinHours,
     regimeMaxMovePct: r.config.regimeMaxMovePct,
+    hedgeRatioPct: r.config.hedgeRatioPct,
     finalValue: r.finalValue,
     returnPct: r.returnPct,
     maxDrawdownPct: r.maxDrawdownPct,
@@ -98,6 +107,8 @@ export function metricsOf(r: PassiveLpResult): LpMetrics {
     timeInRangePct: r.timeInRangePct,
     timeParkedPct: r.timeParkedPct,
     parkEvents: r.parkEvents,
+    hedgePnlUsd: r.hedgePnlUsd,
+    hedgeCostUsd: r.hedgeCostUsd,
     impermanentLossUsd: r.impermanentLossUsd,
     riskAdjusted: r.returnPct / Math.max(Math.abs(r.maxDrawdownPct), 1),
   };
@@ -108,6 +119,7 @@ export function sweepLp(axes: LpAxes, input: LpEvalInput): LpSweepResult {
   let skipped = 0;
 
   const regimes = axes.regimeMaxMovePcts?.length ? axes.regimeMaxMovePcts : [0];
+  const hedges = axes.hedgeRatioPcts?.length ? axes.hedgeRatioPcts : [0];
   for (const rangePct of axes.rangePcts) {
     for (const buffer of axes.recenterBuffers) {
       for (const minHours of axes.recenterMinHours) {
@@ -115,10 +127,12 @@ export function sweepLp(axes: LpAxes, input: LpEvalInput): LpSweepResult {
         // duplicates so the table is not padded with identical rows.
         if (buffer === 0 && minHours !== axes.recenterMinHours[0]) continue;
         for (const regime of regimes) {
-          try {
-            metrics.push(evaluateLp(rangePct, buffer, minHours, input, regime));
-          } catch {
-            skipped++;
+          for (const hedge of hedges) {
+            try {
+              metrics.push(evaluateLp(rangePct, buffer, minHours, input, regime, hedge));
+            } catch {
+              skipped++;
+            }
           }
         }
       }
@@ -152,7 +166,7 @@ export function formatLpTable(metrics: LpMetrics[], metric: string, limit = 15):
   line(RULE);
   line();
   line(
-    "Rank  Range   Recentre  MinHrs  Regime   Return    MaxDD   InRange   Parked   Fee income   Position P&L    Costs  Recentres",
+    "Rank  Range   Recentre  Regime  Hedge    Return    MaxDD   InRange   Parked   Fee income   Position P&L   Hedge P&L  Recentres",
   );
   line(THIN);
   ranked.forEach((m, i) => {
@@ -161,15 +175,15 @@ export function formatLpTable(metrics: LpMetrics[], metric: string, limit = 15):
         String(i + 1).padEnd(6),
         `±${m.rangePct}%`.padEnd(8),
         (m.recenterBufferPct === 0 ? "never" : `${m.recenterBufferPct}%`).padEnd(10),
-        (m.recenterBufferPct === 0 ? "—" : String(m.recenterMinHours)).padEnd(8),
         (m.regimeMaxMovePct > 0 ? `${m.regimeMaxMovePct}%` : "off").padEnd(8),
+        (m.hedgeRatioPct > 0 ? `${m.hedgeRatioPct}%` : "off").padEnd(7),
         pct(m.returnPct).padStart(8),
         `${m.maxDrawdownPct.toFixed(1)}%`.padStart(9),
         `${m.timeInRangePct.toFixed(0)}%`.padStart(9),
         `${m.timeParkedPct.toFixed(0)}%`.padStart(8),
         signedUsd(m.feeIncomeUsd).padStart(13),
         signedUsd(m.positionPnlUsd).padStart(15),
-        signedUsd(-(m.swapCostUsd + m.gasUsd)).padStart(9),
+        signedUsd(m.hedgePnlUsd - m.hedgeCostUsd).padStart(12),
         String(m.recenters).padStart(11),
       ].join(""),
     );

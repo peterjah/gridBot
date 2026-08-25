@@ -44,6 +44,8 @@ export interface LpParams {
   recenterMinHours: number;
   /** Trailing-move threshold for the regime filter; 0 = filter off. */
   regimeMaxMovePct: number;
+  /** Percent of ETH exposure held short; 0 = unhedged. */
+  hedgeRatioPct: number;
 }
 
 export interface LpWalkForwardOptions {
@@ -114,6 +116,7 @@ function runLpFold(
     best.recenterMinHours,
     { ...options.input, prices: test },
     best.regimeMaxMovePct,
+    best.hedgeRatioPct,
   );
 
   const span = (points: PricePoint[]) =>
@@ -134,6 +137,7 @@ function runLpFold(
       recenterBufferPct: best.recenterBufferPct,
       recenterMinHours: best.recenterMinHours,
       regimeMaxMovePct: best.regimeMaxMovePct,
+      hedgeRatioPct: best.hedgeRatioPct,
     },
     train: best,
     test: test_,
@@ -145,9 +149,11 @@ export function describeLpParams(p: LpParams): string {
     p.recenterBufferPct === 0
       ? `±${p.rangePct}%, never re-centred`
       : `±${p.rangePct}%, re-centre beyond ${p.recenterBufferPct}% (min ${p.recenterMinHours}h)`;
-  return p.regimeMaxMovePct > 0
-    ? `${base}, stand aside above ${p.regimeMaxMovePct}% trailing move`
-    : `${base}, regime filter off`;
+  const regime =
+    p.regimeMaxMovePct > 0
+      ? `${base}, stand aside above ${p.regimeMaxMovePct}% trailing move`
+      : `${base}, regime filter off`;
+  return p.hedgeRatioPct > 0 ? `${regime}, ${p.hedgeRatioPct}% short hedge` : regime;
 }
 
 export function formatLpFold(fold: LpFoldResult): string {
@@ -209,7 +215,7 @@ export function formatLpWalkForwardSummary(folds: LpFoldResult[]): string {
   line("PASSIVE LP WALK-FORWARD SUMMARY");
   line(RULE);
   line();
-  line("Fold      Range   Recentre  Regime   Train/yr   Test ret   Test/yr  Test MaxDD  Parked   Test ETH   vs ETH");
+  line("Fold      Range   Recentre  Regime  Hedge   Train/yr   Test ret   Test/yr  Test MaxDD  Parked   Test ETH   vs ETH");
   line(THIN);
   for (const f of folds) {
     line(
@@ -217,7 +223,8 @@ export function formatLpWalkForwardSummary(folds: LpFoldResult[]): string {
         f.name.padEnd(10),
         `±${f.best.rangePct}%`.padEnd(8),
         (f.best.recenterBufferPct === 0 ? "never" : `${f.best.recenterBufferPct}%`).padEnd(10),
-        (f.best.regimeMaxMovePct > 0 ? `${f.best.regimeMaxMovePct}%` : "off").padEnd(9),
+        (f.best.regimeMaxMovePct > 0 ? `${f.best.regimeMaxMovePct}%` : "off").padEnd(8),
+        (f.best.hedgeRatioPct > 0 ? `${f.best.hedgeRatioPct}%` : "off").padEnd(7),
         pct(annualize(f.train.returnPct, f.trainYears)).padStart(10),
         pct(f.test.returnPct).padStart(11),
         pct(annualize(f.test.returnPct, f.testYears)).padStart(10),
@@ -290,5 +297,5 @@ export function selectLpConsensus(folds: LpFoldResult[]): LpConsensusPick[] {
 }
 
 function lpKey(p: LpParams): string {
-  return `${p.rangePct}|${p.recenterBufferPct}|${p.recenterMinHours}|${p.regimeMaxMovePct}`;
+  return `${p.rangePct}|${p.recenterBufferPct}|${p.recenterMinHours}|${p.regimeMaxMovePct}|${p.hedgeRatioPct}`;
 }

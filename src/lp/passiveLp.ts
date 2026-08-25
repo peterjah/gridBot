@@ -53,6 +53,26 @@ export interface PassiveLpConfig {
   regimeMaxMovePct: number;
   /** Observations in the trailing-move window. */
   regimeLookbackPoints: number;
+  /**
+   * Percent of the position's ETH exposure held short, 0 = unhedged.
+   *
+   * A concentrated LP position is structurally long the volatile asset, and
+   * that exposure — not the band width — is what loses money out of sample:
+   * across the walk-forward folds, position P&L of -$15,637 was -$13,763 of
+   * plain price exposure and only -$1,874 of divergence loss.
+   */
+  hedgeRatioPct: number;
+  /** Annualised cost of borrowing the shorted asset, percent. */
+  hedgeBorrowAprPct: number;
+  /**
+   * Only hedge while standing aside, matching the shipped live bot.
+   *
+   * The live hedge opens when parking and closes before deploying, so it
+   * covers the cash ETH held while out of the market but not the LP
+   * position's own delta. Setting this false hedges continuously, which is
+   * what the exposure numbers above actually argue for.
+   */
+  hedgeWhileParkedOnly: boolean;
 }
 
 export interface LpSample {
@@ -101,6 +121,12 @@ export interface PassiveLpResult {
   timeParkedPct: number;
   /** Times the regime filter closed the position. */
   parkEvents: number;
+  /** Mark-to-market P&L of the short leg. */
+  hedgePnlUsd: number;
+  /** Borrow interest plus the swap cost of resizing the short. */
+  hedgeCostUsd: number;
+  /** Times the short was opened, closed or resized. */
+  hedgeRebalances: number;
   /** Value vs holding the initial deposit split unchanged (divergence loss). */
   impermanentLossUsd: number;
   residual: number;
@@ -147,6 +173,7 @@ function openPosition(capital: number, price: number, rangePct: number): Positio
  *
  * Accounting identity, checked by `residual`:
  *   finalValue = initialCapital + positionPnl + feeIncome - swapCosts - gas
+ *                + hedgePnl - hedgeCost
  */
 export function runPassiveLp(
   cfg: PassiveLpConfig,
@@ -176,6 +203,14 @@ export function runPassiveLp(
   // Regime filter state. `parkedCash` holds the position's value while it is
   // closed; fees do not accrue on it, which is exactly the cost of standing
   // aside.
+  // Short leg. `shortEth` is the ETH-denominated size currently borrowed and
+  // sold; it is resized only at transaction points (re-centre, park, unpark),
+  // so delta drifts between them exactly as it would on-chain.
+  let shortEth = 0;
+  let hedgePnlUsd = 0;
+  let hedgeCostUsd = 0;
+  let hedgeRebalances = 0;
+
   let parked = false;
   let parkedCash = 0;
   let parkEvents = 0;
@@ -186,12 +221,34 @@ export function runPassiveLp(
   const samples: LpSample[] = [];
   const recenters: RecenterRecord[] = [];
 
+  /** ETH the book is long right now, whether deployed or parked in cash. */
+  const ethExposure = (price: number): number => {
+    if (parked) return 0; // parked cash is USDC in this model
+    return holdingsOf(position, price).eth;
+  };
+
+  /**
+   * Resize the short toward its target, paying the swap cost on the traded
+   * ETH. Called only at points where the live bot would already be sending a
+   * transaction, so the hedge adds cost but not extra round trips.
+   */
+  const resizeHedge = (price: number): void => {
+    if (!(cfg.hedgeRatioPct > 0)) return;
+    const active = !cfg.hedgeWhileParkedOnly || parked;
+    const target = active ? ethExposure(price) * (cfg.hedgeRatioPct / 100) : 0;
+    const delta = Math.abs(target - shortEth);
+    if (delta * price < 1) return; // not worth a transaction
+    hedgeCostUsd += delta * price * costFrac;
+    hedgeRebalances++;
+    shortEth = target;
+  };
+
   const sampleAt = (point: PricePoint): LpSample => {
     if (parked) {
       return {
         timestamp: point.timestamp,
         price: point.price,
-        portfolioValue: parkedCash + feeCash,
+        portfolioValue: parkedCash + feeCash + hedgePnlUsd - hedgeCostUsd,
         eth: 0,
         usdc: parkedCash,
         feeCash,
@@ -203,7 +260,7 @@ export function runPassiveLp(
     return {
       timestamp: point.timestamp,
       price: point.price,
-      portfolioValue: h.eth * point.price + h.usdc + feeCash,
+      portfolioValue: h.eth * point.price + h.usdc + feeCash + hedgePnlUsd - hedgeCostUsd,
       eth: h.eth,
       usdc: h.usdc,
       feeCash,
@@ -227,6 +284,7 @@ export function runPassiveLp(
     return Math.abs((data[i]!.price / firstPrice - 1) * 100) > cfg.regimeMaxMovePct;
   };
 
+  resizeHedge(first.price);
   samples.push(sampleAt(first));
   let inRangeCount = samples[0]!.inRange ? 1 : 0;
 
@@ -239,6 +297,16 @@ export function runPassiveLp(
     // Fees accrue on the position's value while in range, at the pool's
     // measured rate. Out of range the position is entirely one asset and
     // earns nothing — the central trade-off of concentrated liquidity.
+    // Short leg marked to market: it gains when price falls, which is exactly
+    // the offset to the LP's long exposure.
+    if (shortEth !== 0) {
+      hedgePnlUsd += shortEth * (prev.price - point.price);
+      if (elapsed > 0 && cfg.hedgeBorrowAprPct > 0) {
+        hedgeCostUsd +=
+          shortEth * point.price * (cfg.hedgeBorrowAprPct / 100) * (elapsed / SECONDS_PER_YEAR);
+      }
+    }
+
     const apr = point.feeAprPct ?? 0;
     if (inRange && apr > 0 && elapsed > 0) {
       const h = holdingsOf(position, point.price);
@@ -291,6 +359,7 @@ export function runPassiveLp(
         parked = true;
         parkEvents++;
         lastParkChangeAt = point.timestamp;
+        resizeHedge(point.price);
       } else if (!hostile && parked && dwelled) {
         // Re-enter with everything, including fees collected before parking.
         const capital = parkedCash + feeCash;
@@ -306,6 +375,7 @@ export function runPassiveLp(
         parked = false;
         lastParkChangeAt = point.timestamp;
         lastRecenterAt = point.timestamp;
+        resizeHedge(point.price);
       }
     }
 
@@ -344,6 +414,8 @@ export function runPassiveLp(
         position = openPosition(redeployed, point.price, cfg.rangePct);
         lastRecenterAt = point.timestamp;
 
+        resizeHedge(point.price);
+
         const after = holdingsOf(position, point.price);
         recenters.push({
           timestamp: point.timestamp,
@@ -367,7 +439,13 @@ export function runPassiveLp(
   const positionValue = parked
     ? parkedCash
     : finalHoldings.eth * last.price + finalHoldings.usdc;
-  const finalValue = positionValue + feeCash;
+  // Close the short at the last price, so the result is a realised number.
+  if (shortEth !== 0) {
+    hedgeCostUsd += Math.abs(shortEth) * last.price * costFrac;
+    hedgeRebalances++;
+    shortEth = 0;
+  }
+  const finalValue = positionValue + feeCash + hedgePnlUsd - hedgeCostUsd;
 
   let peak = -Infinity;
   let maxDrawdownPct = 0;
@@ -391,7 +469,13 @@ export function runPassiveLp(
   const positionPnlUsd =
     positionValue - initialCapital - redeployedFees + swapCostUsd + gasUsd;
   const reconstructed =
-    initialCapital + positionPnlUsd + feeIncomeTotal - swapCostUsd - gasUsd;
+    initialCapital +
+    positionPnlUsd +
+    feeIncomeTotal -
+    swapCostUsd -
+    gasUsd +
+    hedgePnlUsd -
+    hedgeCostUsd;
 
   return {
     config: cfg,
@@ -410,6 +494,9 @@ export function runPassiveLp(
     timeInRangePct: (inRangeCount / samples.length) * 100,
     timeParkedPct: (parkedCount / samples.length) * 100,
     parkEvents,
+    hedgePnlUsd,
+    hedgeCostUsd,
+    hedgeRebalances,
     impermanentLossUsd: positionValue - hodlExact,
     residual: reconstructed - finalValue,
   };

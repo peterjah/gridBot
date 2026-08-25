@@ -13,6 +13,9 @@ const base: Omit<PassiveLpConfig, "regimeMaxMovePct"> = {
   slippageBps: 3,
   referenceRangePct: 25,
   regimeLookbackPoints: 24,
+  hedgeRatioPct: 0,
+  hedgeBorrowAprPct: 3,
+  hedgeWhileParkedOnly: false,
 };
 
 /** Flat for `calm` points, then a steady one-way ramp. */

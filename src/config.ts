@@ -194,6 +194,8 @@ export interface AppConfig {
    * (overhead 0, lending leg 0) so existing results are unchanged.
    */
   gas: GasModel;
+  /** Annualised WETH borrow rate used to cost the modelled short hedge. */
+  hedgeBorrowAprPct: number;
   /** Charge money-market legs on trading transactions. */
   lendingGasLegs: boolean;
   grid: GridSettings;
@@ -335,6 +337,7 @@ export function loadConfig(mode: Mode): AppConfig {
       lendingLegUsd: num("GAS_LENDING_LEG_USD", 0),
     },
     lendingGasLegs: bool("GAS_LENDING_LEGS", false),
+    hedgeBorrowAprPct: num("HEDGE_BORROW_APR_PCT", 3),
     // Aave lending of idle liquidity (defaults = official Base deployments)
     lendingEnabled: (env("ENABLE_AAVE") ?? "false").toLowerCase() === "true",
     aavePool: contracts.aavePool,

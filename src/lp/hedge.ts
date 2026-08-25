@@ -143,6 +143,13 @@ export class AaveShortHedge {
       return true;
     }
 
+    // The supply that funds this borrow may have been confirmed by a node
+    // this transport does not talk to. Simulating the borrow against a node
+    // one block behind computes a health factor with ZERO collateral and
+    // reverts — observed live immediately after a confirmed supply. Wait
+    // until the collateral is readable before borrowing.
+    await this.awaitCollateralVisible();
+
     await this.aave.borrow("WETH", notionalEth);
     const borrowedRaw = BigInt(Math.floor(notionalEth * 10 ** this.pool.token0.decimals));
     // Sell everything just borrowed. The quote-based slippage floor protects
@@ -246,6 +253,30 @@ export class AaveShortHedge {
   private async currentPrice(): Promise<number> {
     const state = await getPoolState(this.client, this.pool.address);
     return sqrtRatioToPrice(state.sqrtPriceX96, this.pool.token0.decimals, this.pool.token1.decimals);
+  }
+
+  /**
+   * Block until some supplied balance is visible to reads.
+   *
+   * The transport fails over across RPC endpoints, so the node that confirms
+   * the supply receipt is not necessarily the node that answers the next
+   * call. A borrow simulated against a stale node reverts with no error
+   * message worth acting on, so the wait lives here rather than letting the
+   * revert happen on-chain.
+   */
+  private async awaitCollateralVisible(attempts = 10): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const balances = await this.aave.allBalances();
+      if (balances.usdcLent > 0 || balances.ethLent > 0) {
+        if (i > 0) logger.debug("Hedge: collateral visible after retry", { attempt: i + 1 });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(
+      `Supplied collateral did not become visible after ${attempts}s; ` +
+        `the RPC endpoints may be out of sync. Nothing was lost — the hedge is retried next cycle.`,
+    );
   }
 
   private async ensureApproval(token: Address, spender: Address, amountNeeded: bigint): Promise<void> {
