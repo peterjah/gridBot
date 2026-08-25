@@ -3,10 +3,14 @@ import { LpLendingManager } from "../src/lp/lpLending.js";
 import type { AaveExecutor } from "../src/lending/aaveExecutor.js";
 
 interface Call {
-  kind: "supply" | "withdraw";
+  kind: "supply" | "withdraw" | "withdrawMax";
   asset: "USDC" | "WETH";
-  amount: number;
+  amount: number | bigint;
 }
+
+const RAW = { USDC: 6, WETH: 18 } as const;
+const toRaw = (v: number, decimals: number): bigint =>
+  BigInt(Math.round(v * 10 ** Math.min(decimals, 6))) * 10n ** BigInt(Math.max(decimals - 6, 0));
 
 /** An AaveExecutor stand-in that records what it was asked to do. */
 function fakeAave(balances: {
@@ -18,11 +22,19 @@ function fakeAave(balances: {
   const calls: Call[] = [];
   const aave = {
     allBalances: async () => balances,
-    supply: async (asset: "USDC" | "WETH", amount: number) => {
+    allBalancesRaw: async () => ({
+      usdcWallet: toRaw(balances.usdcWallet, RAW.USDC),
+      usdcLent: toRaw(balances.usdcLent, RAW.USDC),
+      ethWallet: toRaw(balances.ethWallet, RAW.WETH),
+      ethLent: toRaw(balances.ethLent, RAW.WETH),
+    }),
+    // The manager supplies raw units: converting through a JS number rounds
+    // up above 2^53 and asks for more than the wallet holds.
+    supplyRaw: async (asset: "USDC" | "WETH", amount: bigint) => {
       calls.push({ kind: "supply", asset, amount });
     },
-    withdraw: async (asset: "USDC" | "WETH", amount: number) => {
-      calls.push({ kind: "withdraw", asset, amount });
+    withdrawMax: async (asset: "USDC" | "WETH") => {
+      calls.push({ kind: "withdrawMax", asset, amount: 0n });
     },
   } as unknown as AaveExecutor;
   return { aave, calls };
@@ -40,8 +52,8 @@ describe("releaseAll", () => {
     });
     expect(await new LpLendingManager(aave, opts).releaseAll(2500)).toBe(true);
     expect(calls).toEqual([
-      { kind: "withdraw", asset: "USDC", amount: 5000 },
-      { kind: "withdraw", asset: "WETH", amount: 1.5 },
+      { kind: "withdrawMax", asset: "USDC", amount: 0n },
+      { kind: "withdrawMax", asset: "WETH", amount: 0n },
     ]);
   });
 
@@ -57,7 +69,7 @@ describe("releaseAll", () => {
       ethLent: 0.0001,
     });
     await new LpLendingManager(aave, opts).releaseAll(2500);
-    expect(calls.map((c) => c.kind)).toEqual(["withdraw", "withdraw"]);
+    expect(calls.map((c) => c.kind)).toEqual(["withdrawMax", "withdrawMax"]);
   });
 
   it("does nothing when nothing is lent", async () => {
@@ -79,7 +91,7 @@ describe("releaseAll", () => {
       ethLent: 0,
     });
     await new LpLendingManager(aave, opts).releaseAll(2500);
-    expect(calls).toEqual([{ kind: "withdraw", asset: "USDC", amount: 1000 }]);
+    expect(calls).toEqual([{ kind: "withdrawMax", asset: "USDC", amount: 0n }]);
   });
 
   it("broadcasts nothing in dry run", async () => {
@@ -106,8 +118,8 @@ describe("parkIdle", () => {
     });
     expect(await new LpLendingManager(aave, opts).parkIdle(2500)).toBe(true);
     expect(calls).toEqual([
-      { kind: "supply", asset: "USDC", amount: 5000 },
-      { kind: "supply", asset: "WETH", amount: 1 },
+      { kind: "supply", asset: "USDC", amount: toRaw(5000, RAW.USDC) },
+      { kind: "supply", asset: "WETH", amount: toRaw(1, RAW.WETH) },
     ]);
   });
 
@@ -126,7 +138,9 @@ describe("parkIdle", () => {
     // 0.05 ETH is $125 at 2500 (above the $100 minimum) but $50 at 1000.
     const above = fakeAave({ usdcWallet: 0, usdcLent: 0, ethWallet: 0.05, ethLent: 0 });
     await new LpLendingManager(above.aave, opts).parkIdle(2500);
-    expect(above.calls).toEqual([{ kind: "supply", asset: "WETH", amount: 0.05 }]);
+    expect(above.calls).toEqual([
+      { kind: "supply", asset: "WETH", amount: toRaw(0.05, RAW.WETH) },
+    ]);
 
     const below = fakeAave({ usdcWallet: 0, usdcLent: 0, ethWallet: 0.05, ethLent: 0 });
     await new LpLendingManager(below.aave, opts).parkIdle(1000);
@@ -141,7 +155,7 @@ describe("parkIdle", () => {
       ethLent: 0,
     });
     await new LpLendingManager(aave, opts).parkIdle(2500);
-    expect(calls).toEqual([{ kind: "supply", asset: "USDC", amount: 5000 }]);
+    expect(calls).toEqual([{ kind: "supply", asset: "USDC", amount: toRaw(5000, RAW.USDC) }]);
   });
 
   it("broadcasts nothing in dry run", async () => {
@@ -162,15 +176,27 @@ describe("round trip", () => {
     const calls: Call[] = [];
     const aave = {
       allBalances: async () => state,
-      supply: async (asset: "USDC" | "WETH", amount: number) => {
+      allBalancesRaw: async () => ({
+        usdcWallet: toRaw(state.usdcWallet, RAW.USDC),
+        usdcLent: toRaw(state.usdcLent, RAW.USDC),
+        ethWallet: toRaw(state.ethWallet, RAW.WETH),
+        ethLent: toRaw(state.ethLent, RAW.WETH),
+      }),
+      supplyRaw: async (asset: "USDC" | "WETH", amount: bigint) => {
         calls.push({ kind: "supply", asset, amount });
-        if (asset === "USDC") state = { ...state, usdcWallet: 0, usdcLent: amount };
-        else state = { ...state, ethWallet: 0, ethLent: amount };
+        // Mirror the chain: the supplied raw amount becomes the lent balance.
+        const human = Number(amount) / 10 ** (asset === "USDC" ? RAW.USDC : RAW.WETH);
+        if (asset === "USDC") state = { ...state, usdcWallet: 0, usdcLent: human };
+        else state = { ...state, ethWallet: 0, ethLent: human };
       },
-      withdraw: async (asset: "USDC" | "WETH", amount: number) => {
-        calls.push({ kind: "withdraw", asset, amount });
-        if (asset === "USDC") state = { ...state, usdcWallet: amount, usdcLent: 0 };
-        else state = { ...state, ethWallet: amount, ethLent: 0 };
+      withdrawMax: async (asset: "USDC" | "WETH") => {
+        calls.push({
+          kind: "withdrawMax",
+          asset,
+          amount: asset === "USDC" ? state.usdcLent : state.ethLent,
+        });
+        if (asset === "USDC") state = { ...state, usdcWallet: state.usdcLent, usdcLent: 0 };
+        else state = { ...state, ethWallet: state.ethLent, ethLent: 0 };
       },
     } as unknown as AaveExecutor;
 
@@ -182,5 +208,49 @@ describe("round trip", () => {
     expect(state.ethWallet).toBe(1);
     expect(state.usdcLent).toBe(0);
     expect(state.ethLent).toBe(0);
+  });
+});
+
+/**
+ * The production failure: topping up to 0.14 WETH, the bot asked Aave for
+ * 140000000000000016 wei — 16 more than the wallet held — and the supply
+ * reverted. `Math.floor(0.14 * 1e18)` is not 1.4e17: 18-decimal amounts sit
+ * sixteen times beyond Number.MAX_SAFE_INTEGER, so the raw -> number -> raw
+ * round trip is lossy and can round UP past the balance.
+ */
+describe("precision", () => {
+  it("supplies exactly the wallet balance, never a wei more", async () => {
+    const walletRaw = 140_000_000_000_000_000n; // 0.14 WETH
+    const calls: bigint[] = [];
+    const aave = {
+      allBalances: async () => ({
+        usdcWallet: 0,
+        usdcLent: 0,
+        ethWallet: 0.14,
+        ethLent: 0,
+      }),
+      allBalancesRaw: async () => ({
+        usdcWallet: 0n,
+        usdcLent: 0n,
+        ethWallet: walletRaw,
+        ethLent: 0n,
+      }),
+      supplyRaw: async (_asset: "USDC" | "WETH", amount: bigint) => {
+        calls.push(amount);
+      },
+      withdrawMax: async () => {},
+    } as unknown as AaveExecutor;
+
+    await new LpLendingManager(aave, { minActionUsd: 1, dryRun: false }).parkIdle(2500);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toBe(walletRaw);
+    expect(calls[0]! <= walletRaw).toBe(true);
+  });
+
+  it("demonstrates why the number round trip could not be used", () => {
+    // Kept as an executable note: this is the arithmetic that reverted.
+    expect(Math.floor(0.14 * 1e18)).not.toBe(140_000_000_000_000_000);
+    expect(BigInt(Math.floor(0.14 * 1e18)) > 140_000_000_000_000_000n).toBe(true);
   });
 });

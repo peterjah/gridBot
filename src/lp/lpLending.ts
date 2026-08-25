@@ -59,9 +59,11 @@ export class LpLendingManager {
     }
 
     // No minimum here: a leftover balance would silently shrink the position.
-    // Withdrawing dust costs a few cents; under-deploying costs yield.
-    if (usdcLent > 0) await this.aave.withdraw("USDC", usdcLent);
-    if (ethLent > 0) await this.aave.withdraw("WETH", ethLent);
+    // Withdrawing dust costs a few cents; under-deploying costs yield. Max
+    // withdraw because a computed amount can round one unit above the actual
+    // balance and revert — exactly when the bot needs to deploy.
+    if (usdcLent > 0) await this.aave.withdrawMax("USDC");
+    if (ethLent > 0) await this.aave.withdrawMax("WETH");
     return true;
   }
 
@@ -73,6 +75,7 @@ export class LpLendingManager {
    * ETH for gas is untouched — Aave holds WETH, which is a separate balance.
    */
   async parkIdle(ethPrice: number): Promise<boolean> {
+    const raw = await this.aave.allBalancesRaw();
     const balances = await this.aave.allBalances();
     const usdcWallet = balances.usdcWallet;
     const ethWallet = balances.ethWallet;
@@ -101,8 +104,10 @@ export class LpLendingManager {
       return true;
     }
 
-    if (supplyUsdc) await this.aave.supply("USDC", usdcWallet);
-    if (supplyEth) await this.aave.supply("WETH", ethWallet);
+    // Supply the exact wallet balance in raw units. The human-number form
+    // rounds up above 2^53 and asks for more than the wallet holds.
+    if (supplyUsdc) await this.aave.supplyRaw("USDC", raw.usdcWallet);
+    if (supplyEth) await this.aave.supplyRaw("WETH", raw.ethWallet);
     return true;
   }
 

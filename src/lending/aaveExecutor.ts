@@ -1,5 +1,5 @@
 import type { Address } from "viem";
-import { encodeFunctionData, erc20Abi, formatUnits } from "viem";
+import { encodeFunctionData, erc20Abi, formatUnits, parseUnits } from "viem";
 import type { AppConfig } from "../config.js";
 import type { BotClient } from "../blockchain/client.js";
 import { createTransactor } from "../blockchain/wallet.js";
@@ -33,15 +33,8 @@ export interface AssetPair {
   underlying: Address;
   /** Corresponding aToken (interest-bearing). */
   aToken: Address;
-  /**
-   * Corresponding variable-rate debt token.
-   *
-   * Optional while the short-hedge work that needs it is in progress: supply
-   * and withdraw do not touch debt, so requiring it here breaks every existing
-   * caller for a field none of them use. Tighten to required once the borrow
-   * path and its config land.
-   */
-  debtToken?: Address;
+  /** Corresponding variable-rate debt token (borrows rebase upward with interest). */
+  debtToken: Address;
   decimals: number;
   symbol: string;
 }
@@ -196,6 +189,32 @@ export class AaveExecutor {
     return out;
   }
 
+  /**
+   * Wallet + lent balances in raw token units.
+   *
+   * Callers that move money must use these. Converting to a JS number and back
+   * is lossy above 2^53: 0.14 WETH is 1.4e17 wei, sixteen times beyond
+   * MAX_SAFE_INTEGER, and the round trip rounded UP to 16 wei more than the
+   * wallet held, which reverted.
+   */
+  async allBalancesRaw(): Promise<{
+    usdcWallet: bigint;
+    usdcLent: bigint;
+    ethWallet: bigint;
+    ethLent: bigint;
+  }> {
+    const [usdc, weth] = await walletAndLentBalances(this.client, this.wallet, [
+      { token: this.usdc.underlying, aToken: this.usdc.aToken },
+      { token: this.weth.underlying, aToken: this.weth.aToken },
+    ]);
+    return {
+      usdcWallet: usdc!.wallet,
+      usdcLent: usdc!.lent,
+      ethWallet: weth!.wallet,
+      ethLent: weth!.lent,
+    };
+  }
+
   /** Wallet + lent balance for one asset, in a single request. */
   async balancesFor(asset: "USDC" | "WETH"): Promise<{ wallet: number; lent: number }> {
     const a = this.asset(asset);
@@ -208,9 +227,59 @@ export class AaveExecutor {
     };
   }
 
+  /** Supply an exact raw amount. Prefer this over the human-number form. */
+  async supplyRaw(assetName: "USDC" | "WETH", amountRaw: bigint): Promise<void> {
+    const a = this.asset(assetName);
+    if (amountRaw <= 0n) {
+      logger.debug("Aave: supply skipped (zero amount)", { asset: assetName });
+      return;
+    }
+    await this.ensureApproval(a.underlying, this.pool, amountRaw);
+    const data = encodeFunctionData({
+      abi: poolAbi,
+      functionName: "supply",
+      args: [a.underlying, amountRaw, this.wallet, 0],
+    });
+    logger.info("Aave: supplying", {
+      asset: assetName,
+      amount: formatUnits(amountRaw, a.decimals),
+    });
+    const hash = await this.transactor.send(this.client, "aave-supply", this.pool, data);
+    logger.debug("Aave: supply confirmed", { asset: assetName, txHash: hash });
+  }
+
+  /**
+   * Withdraw an exact raw amount, or everything when `amountRaw` is
+   * MAX_UINT256 — Aave treats that as "the whole balance", which is exact by
+   * construction and avoids asking for a wei more than was supplied.
+   */
+  async withdrawRaw(assetName: "USDC" | "WETH", amountRaw: bigint): Promise<void> {
+    const a = this.asset(assetName);
+    if (amountRaw <= 0n) {
+      logger.debug("Aave: withdraw skipped (zero amount)", { asset: assetName });
+      return;
+    }
+    const data = encodeFunctionData({
+      abi: poolAbi,
+      functionName: "withdraw",
+      args: [a.underlying, amountRaw, this.wallet],
+    });
+    logger.info("Aave: withdrawing", {
+      asset: assetName,
+      amount: amountRaw === MAX_UINT256 ? "all" : formatUnits(amountRaw, a.decimals),
+    });
+    const hash = await this.transactor.send(this.client, "aave-withdraw", this.pool, data);
+    logger.debug("Aave: withdraw confirmed", { asset: assetName, txHash: hash });
+  }
+
+
+  /**
+   * Human-number convenience wrapper. Lossy for large 18-decimal amounts, so
+   * anything moving a full balance should use `supplyRaw`.
+   */
   async supply(assetName: "USDC" | "WETH", amountHuman: number): Promise<void> {
     const a = this.asset(assetName);
-    const amountRaw = BigInt(Math.floor(amountHuman * 10 ** a.decimals));
+    const amountRaw = parseUnits(amountHuman.toFixed(a.decimals), a.decimals);
     if (amountRaw <= 0n) {
       logger.debug("Aave: supply skipped (zero amount)", { asset: assetName, amountHuman });
       return;
@@ -227,9 +296,11 @@ export class AaveExecutor {
     logger.debug("Aave: supply confirmed", { asset: assetName, txHash: hash });
   }
 
+  /** Human-number convenience wrapper. See the note on `supply`. */
   async withdraw(assetName: "USDC" | "WETH", amountHuman: number): Promise<void> {
     const a = this.asset(assetName);
-    const amountRaw = BigInt(Math.ceil(amountHuman * 10 ** a.decimals));
+    // Never round UP: asking for more than was supplied reverts.
+    const amountRaw = parseUnits(amountHuman.toFixed(a.decimals), a.decimals);
     if (amountRaw <= 0n) {
       logger.debug("Aave: withdraw skipped (zero amount)", { asset: assetName, amountHuman });
       return;
