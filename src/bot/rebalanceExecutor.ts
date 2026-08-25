@@ -174,6 +174,8 @@ export class RebalanceExecutor {
         position.liquidity > 0n
           ? await this.decreaseLiquidity(position)
           : { amount0: 0n, amount1: 0n };
+      // Always collect, even at zero liquidity: a previous cycle may have
+      // withdrawn and then failed, leaving everything as tokensOwed.
       const collected = await this.collect(position);
       this.reportFees(withdrawn, collected, sqrtPriceX96);
     }
@@ -221,22 +223,33 @@ export class RebalanceExecutor {
    * re-entry needs both tokens back anyway.
    */
   async closePosition(position: PositionInfo, sqrtPriceX96: bigint): Promise<void> {
-    if (position.liquidity === 0n) return;
+    // Zero liquidity does NOT mean there is nothing to do: if a previous
+    // attempt withdrew but failed before collecting, the principal and fees
+    // are sitting in the position as tokensOwed. Returning early here strands
+    // them permanently, because every later cycle sees liquidity 0 too.
+    const owed = position.tokensOwed0 > 0n || position.tokensOwed1 > 0n;
+    if (position.liquidity === 0n && !owed) return;
 
     if (this.config.dryRun) {
       logger.info("[DRY RUN] Would stand aside", {
         tokenId: position.tokenId.toString(),
         liquidity: position.liquidity.toString(),
-        steps: ["decreaseLiquidity", "collect"],
+        tokensOwed0: position.tokensOwed0.toString(),
+        tokensOwed1: position.tokensOwed1.toString(),
+        steps: [...(position.liquidity > 0n ? ["decreaseLiquidity"] : []), "collect"],
       });
       return;
     }
 
-    const withdrawn = await this.decreaseLiquidity(position);
+    const withdrawn =
+      position.liquidity > 0n
+        ? await this.decreaseLiquidity(position)
+        : { amount0: 0n, amount1: 0n };
     const collected = await this.collect(position);
     this.reportFees(withdrawn, collected, sqrtPriceX96);
     logger.info("Standing aside — position closed to cash", {
       tokenId: position.tokenId.toString(),
+      recoveredOwedOnly: position.liquidity === 0n,
     });
   }
 
@@ -382,7 +395,7 @@ export class RebalanceExecutor {
     });
 
     const hash = await this.send("mint", this.config.positionManagerAddress, data);
-    const receipt = await this.client.getTransactionReceipt({ hash });
+    const receipt = await this.client.waitForTransactionReceipt({ hash });
 
     let newTokenId: bigint | undefined;
     for (const log of receipt.logs) {
@@ -409,7 +422,22 @@ export class RebalanceExecutor {
     hash: `0x${string}`,
     eventName: "IncreaseLiquidity" | "DecreaseLiquidity" | "Collect",
   ): Promise<TokenAmounts | null> {
-    const receipt = await this.client.getTransactionReceipt({ hash });
+    // waitForTransactionReceipt polls and tolerates a lagging node.
+    // getTransactionReceipt does not: behind a load balancer the follow-up
+    // call can land on a node that has not seen the block yet and throw,
+    // which previously aborted the cycle BETWEEN decreaseLiquidity and
+    // collect and left the position withdrawn but uncollected.
+    let receipt;
+    try {
+      receipt = await this.client.waitForTransactionReceipt({ hash });
+    } catch (error) {
+      logger.warn("Could not read receipt for fee accounting; continuing", {
+        eventName,
+        hash,
+        error: error instanceof Error ? error.message.split("\n")[0] : String(error),
+      });
+      return null;
+    }
     for (const log of receipt.logs) {
       try {
         const decoded = decodeEventLog({ abi: npmEventsAbi, data: log.data, topics: log.topics });
@@ -450,7 +478,16 @@ export class RebalanceExecutor {
       Number(formatUnits(fee0, this.pool.token0.decimals)) * price +
       Number(formatUnits(fee1, this.pool.token1.decimals));
 
-    const state = recordFees(this.config.stateFile, fee0, fee1, feeUsd);
+    // Accounting must never be able to break the transaction sequence.
+    let state;
+    try {
+      state = recordFees(this.config.stateFile, fee0, fee1, feeUsd);
+    } catch (error) {
+      logger.warn("Could not persist fee totals; continuing", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     const sinceIso = state.firstDeployedAt;
     const days =
       sinceIso === null ? 0 : (Date.now() - new Date(sinceIso).getTime()) / 86_400_000;

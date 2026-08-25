@@ -308,6 +308,44 @@ The chain is the source of truth throughout: balances are re-read after closing
 and after the swap, and the mint amounts are recomputed from live balances, so a
 partial failure is recoverable by simply running the next cycle.
 
+## Operational notes from the first live run
+
+2026-08-25, Base, ~$41 of test capital. The strategy logic behaved correctly —
+the regime filter read +30.5% over 168h, called `HOSTILE`, and closed the
+position rather than deploying into a run-up. The plumbing failed in four ways,
+all now fixed and covered by tests.
+
+**Never run two instances against one wallet.** Two bots allocate the same
+nonce and fight over the same position. The first run produced
+`replacement transaction underpriced` and a position that appeared in state
+without either instance logging a mint. `lp-live` now takes an exclusive lock
+on `<STATE_FILE>.lock` at startup and refuses to start if a live process holds
+it; a lock left by a dead process is reclaimed automatically.
+
+**A failed `collect` used to strand funds.** `closePosition` returned early on
+zero liquidity, so when `decreaseLiquidity` succeeded and `collect` failed, the
+principal and fees sat in the position as `tokensOwed` and every later cycle
+skipped them. It now collects whenever liquidity **or** owed tokens are
+non-zero. Nothing was actually lost in the incident, but the code path was
+capable of losing everything withdrawn.
+
+**Fee accounting must never abort the transaction sequence.** Reading a receipt
+with `getTransactionReceipt` immediately after `waitForTransactionReceipt` can
+hit a load-balanced node that has not seen the block yet, which threw and
+aborted the cycle *between* `decreaseLiquidity` and `collect` — the exact
+window that strands funds. Receipts are now read with
+`waitForTransactionReceipt`, and both the read and the state write are
+non-fatal.
+
+**Nonces are tracked locally.** After a receipt arrives the RPC may still
+report the pre-transaction pending nonce, so back-to-back sends reused it. The
+transactor now allocates nonces itself, serializes sends, and resyncs from the
+chain once on a nonce rejection.
+
+If a run is interrupted mid-sequence, the recovery path is simply to start
+again: the chain is the source of truth, and the next cycle collects anything
+left owed before doing anything else.
+
 ## Choosing parameters
 
 Sweep on history first, then deploy the winning row:

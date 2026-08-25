@@ -4,6 +4,7 @@ import { getPoolInfo } from "../uniswap/pool.js";
 import { CenteredRangeStrategy } from "../strategy/centeredRange.js";
 import { Monitor } from "../bot/monitor.js";
 import { ensureStateDir, loadState, saveState, seedPriceHistory } from "../bot/state.js";
+import { acquireLock } from "../bot/lock.js";
 import { loadPrices } from "./backtest.js";
 import type { AppConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -52,6 +53,9 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
   }
 
   ensureStateDir(lp.stateFile);
+  // Claim the wallet before touching the chain. Two instances sharing one
+  // wallet collide on nonces and fight over the position.
+  acquireLock(lp.stateFile);
 
   // Seed the regime window from history so the filter is not blind for its
   // whole lookback on a fresh deployment.
