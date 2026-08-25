@@ -8,25 +8,47 @@ set -eu
 
 log() { printf '%s\n' "$*" >&2; }
 
+# A misconfiguration cannot be fixed by trying again, but `restart:
+# unless-stopped` will try anyway. Pause before exiting so the failure is
+# readable instead of a flood, and say what to actually do about it.
+CONFIG_ERROR_PAUSE="${CONFIG_ERROR_PAUSE:-30}"
+die_config() {
+  log "error: $1"
+  shift
+  for line in "$@"; do log "       $line"; done
+  log ""
+  log "This is a configuration error; restarting will not fix it."
+  log "Edit .env, then apply it with:  docker compose up -d --force-recreate"
+  log "(\`docker compose restart\` reuses the old environment.)"
+  log "Pausing ${CONFIG_ERROR_PAUSE}s so this does not spin."
+  sleep "$CONFIG_ERROR_PAUSE"
+  exit 1
+}
+
 : "${REGIME_MAX_MOVE_PCT:=0}"
 : "${LP_REGIME_LOOKBACK_HOURS:=168}"
 : "${LP_SEED_FILE:=/app/state/seed-5m.csv}"
 : "${SEED_DAYS:=30}"
 : "${FETCH_SEED:=1}"
 
-if [ -z "${RPC_URL:-}" ];      then log "error: RPC_URL is not set";      exit 1; fi
-if [ -z "${POOL_ADDRESS:-}" ]; then log "error: POOL_ADDRESS is not set"; exit 1; fi
+[ -n "${RPC_URL:-}" ]      || die_config "RPC_URL is not set" "Set it in .env."
+[ -n "${POOL_ADDRESS:-}" ] || die_config "POOL_ADDRESS is not set" "Set it in .env."
 
 if [ "${DRY_RUN:-true}" = "false" ]; then
-  if [ -z "${PRIVATE_KEY:-}" ]; then
-    log "error: DRY_RUN=false requires PRIVATE_KEY"
-    exit 1
-  fi
+  [ -n "${PRIVATE_KEY:-}" ] ||
+    die_config "DRY_RUN=false requires PRIVATE_KEY" "Set PRIVATE_KEY in .env."
+
   if [ "${LIVE_CONFIRM:-}" != "yes" ]; then
-    log "error: DRY_RUN=false requires LIVE_CONFIRM=yes."
-    log "       There is no prompt in a container; setting both is the"
-    log "       deliberate act of authorising real transactions."
-    exit 1
+    die_config \
+      "DRY_RUN=false requires LIVE_CONFIRM=yes (currently '${LIVE_CONFIRM:-<empty>}')." \
+      "There is no prompt in a container, so setting BOTH is the deliberate" \
+      "act of authorising real transactions." \
+      "" \
+      "Add this line to .env:" \
+      "    LIVE_CONFIRM=yes" \
+      "" \
+      "Or go back to a dry run with:" \
+      "    DRY_RUN=true"
   fi
   log "MODE: LIVE — real transactions, real funds"
 else

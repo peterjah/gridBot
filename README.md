@@ -187,7 +187,15 @@ measurement.
 Broadcasting requires **both** `DRY_RUN=false` and `LIVE_CONFIRM=yes` in
 `.env`. There is no prompt in a container, so setting both is the deliberate
 act of authorising real transactions; the entrypoint refuses to start with only
-one of them.
+one of them, and says which is missing.
+
+Environment is baked into the container when it is created, so after editing
+`.env`:
+
+```bash
+docker compose up -d --force-recreate   # picks up the new .env
+docker compose restart                  # does NOT — reuses the old environment
+```
 
 Strategy parameters are environment variables, overridable in `.env`:
 
