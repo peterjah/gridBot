@@ -170,6 +170,7 @@ export function trailingMovePct(
   history: PriceSample[],
   now: number,
   windowSeconds: number,
+  currentPrice?: number,
 ): number | null {
   if (history.length < 2) return null;
   // Never look past `now`: the caller may evaluate a historical instant, and
@@ -182,7 +183,12 @@ export function trailingMovePct(
     if (now - sample.t >= windowSeconds) reference = sample;
   }
   if (latest === null || reference === null || !(reference.p > 0)) return null;
-  return (latest.p / reference.p - 1) * 100;
+  // The far end of the window has to come from the stored samples, but the
+  // near end should not: history is sampled at `regimeSampleMinutes`, so using
+  // it would judge a move that ended up to that long ago. A risk control must
+  // see the price it can actually act on.
+  const near = currentPrice !== undefined && currentPrice > 0 ? currentPrice : latest.p;
+  return (near / reference.p - 1) * 100;
 }
 
 /**

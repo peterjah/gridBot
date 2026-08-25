@@ -136,7 +136,9 @@ export class Monitor {
       this.config.regimeSampleMinutes * 60,
       windowSeconds,
     );
-    const move = trailingMovePct(persisted.priceHistory, nowSec, windowSeconds);
+    // Pass the live price so the filter reacts at the poll interval, not at
+    // the (much coarser) sampling interval.
+    const move = trailingMovePct(persisted.priceHistory, nowSec, windowSeconds, price);
     const filterOn = this.config.regimeMaxMovePct > 0;
     // Not enough history is not evidence of a big move — same convention as
     // the backtest, which stays invested until the window fills.

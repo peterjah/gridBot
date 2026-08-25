@@ -110,6 +110,39 @@ describe("regime price history", () => {
     expect(move!).toBeCloseTo((148 / 124 - 1) * 100, 4);
   });
 
+  it("uses the live price for the near end when given one", () => {
+    const s = emptyState();
+    for (let h = 0; h <= 48; h++) recordPriceSample(s, h * 3600, 100 + h, 3600, 48 * 3600);
+    const now = 48 * 3600;
+    // 24h ago the price was 124. Sampled near end is 148; live is 200.
+    expect(trailingMovePct(s.priceHistory, now, 24 * 3600)).toBeCloseTo(
+      (148 / 124 - 1) * 100,
+      6,
+    );
+    expect(trailingMovePct(s.priceHistory, now, 24 * 3600, 200)).toBeCloseTo(
+      (200 / 124 - 1) * 100,
+      6,
+    );
+  });
+
+  it("reacts to a live move the sampled history has not recorded yet", () => {
+    const s = emptyState();
+    // Flat for two days at hourly samples, so the sampled move is zero.
+    for (let h = 0; h <= 48; h++) recordPriceSample(s, h * 3600, 100, 3600, 48 * 3600);
+    const now = 48 * 3600;
+    expect(trailingMovePct(s.priceHistory, now, 24 * 3600)).toBeCloseTo(0, 9);
+    // A crash between samples must be visible immediately.
+    expect(trailingMovePct(s.priceHistory, now, 24 * 3600, 70)!).toBeCloseTo(-30, 6);
+  });
+
+  it("ignores a non-positive live price", () => {
+    const s = emptyState();
+    for (let h = 0; h <= 48; h++) recordPriceSample(s, h * 3600, 100 + h, 3600, 48 * 3600);
+    const now = 48 * 3600;
+    const sampled = trailingMovePct(s.priceHistory, now, 24 * 3600);
+    expect(trailingMovePct(s.priceHistory, now, 24 * 3600, 0)).toBe(sampled);
+  });
+
   it("is causal: only samples at or before `now` are used", () => {
     const s = emptyState();
     for (let h = 0; h <= 48; h++) recordPriceSample(s, h * 3600, 100 + h, 3600, 48 * 3600);
