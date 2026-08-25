@@ -35,6 +35,13 @@ services:
       LP_REGIME_SAMPLE_MINUTES: "${LP_REGIME_SAMPLE_MINUTES:-60}"
       SEED_DAYS: "${SEED_DAYS:-30}"
 
+      # --- Aave lending of idle capital ----------------------------------
+      # The regime filter stands aside most of the time; lending recovers
+      # some of what that idleness costs. Everything is withdrawn before the
+      # bot deploys, so lent assets are always available for LP.
+      ENABLE_AAVE: "${ENABLE_AAVE:-false}"
+      LEND_MIN_ACTION_USD: "${LEND_MIN_ACTION_USD:-100}"
+
     volumes:
       # Position id, fee totals and the regime price window. Losing this means
       # losing track of the position and the whole fee measurement.

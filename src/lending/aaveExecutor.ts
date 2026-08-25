@@ -63,15 +63,24 @@ export class AaveExecutor {
   private readonly wallet: Address;
   private readonly transactor: ReturnType<typeof createTransactor>;
 
+  /**
+   * `transactor` should be the caller's existing one whenever it has it.
+   *
+   * Each transactor tracks nonces locally, so two of them signing for the same
+   * wallet allocate the same nonce and the node rejects the second as
+   * "replacement transaction underpriced". Sharing one keeps the sequence
+   * consistent across Uniswap and Aave calls.
+   */
   constructor(
     client: BotClient,
     cfg: AppConfig,
     private readonly usdc: AssetPair,
     private readonly weth: AssetPair,
     privateKey: `0x${string}`,
+    transactor?: ReturnType<typeof createTransactor>,
   ) {
     this.client = client;
-    this.transactor = createTransactor(privateKey, cfg.rpcUrls);
+    this.transactor = transactor ?? createTransactor(privateKey, cfg.rpcUrls);
     this.wallet = cfg.walletAddress ?? this.transactor.account.address;
   }
 

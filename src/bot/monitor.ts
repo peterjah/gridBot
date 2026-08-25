@@ -14,6 +14,7 @@ import {
 } from "./state.js";
 import type { Strategy } from "../strategy/rebalance.js";
 import { RebalanceExecutor } from "./rebalanceExecutor.js";
+import type { LpLendingManager } from "../lp/lpLending.js";
 import { sqrtRatioToPrice } from "../utils/math.js";
 import { logger } from "../utils/logger.js";
 
@@ -32,6 +33,8 @@ export class Monitor {
     private readonly pollIntervalSeconds: number,
     private readonly pool: PoolInfo,
     private readonly strategy: Strategy,
+    /** Optional: lends idle capital while the bot stands aside. */
+    private readonly lending: LpLendingManager | null = null,
   ) {
     this.executor = new RebalanceExecutor(
       client,
@@ -75,6 +78,7 @@ export class Monitor {
         this.config.regimeMaxMovePct > 0
           ? `stand aside above ${this.config.regimeMaxMovePct}% over ${this.config.regimeLookbackHours}h`
           : "off",
+      lending: this.lending !== null ? "Aave V3 while standing aside" : "off",
     });
 
     for (;;) {
@@ -212,6 +216,20 @@ export class Monitor {
           dwelled,
         });
       }
+
+      // Idle capital earns nothing, and the filter is deliberately idle most
+      // of the time. Run this on every hostile cycle, not just the one that
+      // closes the position, so a deposit arriving mid-park is picked up too.
+      if (this.lending !== null) {
+        try {
+          await this.lending.parkIdle(price);
+        } catch (error) {
+          // Yield is an optimisation; never let it break the risk control.
+          logger.warn("Could not supply idle balance to Aave", {
+            error: error instanceof Error ? error.message.split("\n")[0] : String(error),
+          });
+        }
+      }
       return;
     }
 
@@ -248,6 +266,13 @@ export class Monitor {
         ).toISOString(),
       });
       return;
+    }
+
+    // Withdraw before anything reads a balance. The rebalance plan sizes the
+    // position from the wallet, so deploying first would fund it from the
+    // un-lent remainder and quietly leave the rest in Aave.
+    if (this.lending !== null) {
+      await this.lending.releaseAll(price);
     }
 
     if ((!position || position.liquidity === 0n) && (await this.walletIsEmpty())) {

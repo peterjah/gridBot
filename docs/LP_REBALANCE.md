@@ -316,6 +316,42 @@ The chain is the source of truth throughout: balances are re-read after closing
 and after the swap, and the mint amounts are recomputed from live balances, so a
 partial failure is recoverable by simply running the next cycle.
 
+## Lending idle capital
+
+The regime filter is parked 55-69% of the time at the thresholds that help, and
+cash sitting in the wallet earns nothing. That idleness is the largest cost of
+running the filter. `ENABLE_AAVE=true` supplies idle USDC and WETH to Aave V3
+while standing aside.
+
+The invariant is that **lent assets are always available for LP**:
+
+* `releaseAll()` withdraws everything before the bot deploys, and the monitor
+  awaits it *before* anything reads a wallet balance. The rebalance plan sizes
+  the position from that balance, so deploying first would fund the position
+  from the un-lent remainder and quietly leave the rest in Aave. A test pins
+  the ordering.
+* `releaseAll()` applies no minimum. A threshold there would leave a remainder
+  behind; withdrawing dust costs a few cents, under-deploying costs yield.
+* `parkIdle()` does apply `LEND_MIN_ACTION_USD` (default $100), so gas is never
+  spent moving dust into Aave. It runs on every hostile cycle, not only the one
+  that closes the position, so a deposit arriving mid-park is picked up.
+* A failure to supply is logged and swallowed. Yield is an optimisation and must
+  never break the risk control; a failure to *withdraw* is not swallowed,
+  because deploying after one would under-fund the position.
+
+Native ETH for gas is untouched — Aave holds WETH, which is a separate balance.
+
+**Supply and withdraw are separate transactions.** Aave's Pool has no batch
+entry point, and SwapRouter02's `multicall` delegatecalls into itself, so it
+cannot reach an external contract. Combining an Aave withdrawal and a Uniswap
+action atomically needs a smart account (EIP-7702). At the Base gas prices
+observed live (~$0.006 per transaction) that complexity does not pay for itself.
+
+One caution: Aave's supply APR on Base stablecoins is typically low single
+digits, and the bot only earns it while parked. On a $10,000 account parked 65%
+of the time at 3% APR that is roughly $195/year — real, but not what decides
+whether this strategy works.
+
 ## Operational notes from the first live run
 
 2026-08-25, Base, ~$41 of test capital. The strategy logic behaved correctly —
