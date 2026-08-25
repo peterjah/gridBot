@@ -518,6 +518,37 @@ export class RebalanceExecutor {
       args: [spender, MAX_UINT256],
     });
     await this.send("approve", token, data);
+    await this.awaitAllowance(token, spender, amountNeeded);
+  }
+
+  /**
+   * Block until the approval is visible to reads.
+   *
+   * The transport fails over across RPC endpoints, so the node that confirms
+   * the approval receipt is not necessarily the one that answers the next
+   * call. Acting against a node one block behind reverts with "transfer
+   * amount exceeds allowance" even though the approval landed.
+   */
+  private async awaitAllowance(
+    token: Address,
+    spender: Address,
+    amountNeeded: bigint,
+    attempts = 10,
+  ): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const allowance = await this.client.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: "allowance",
+        args: [this.wallet, spender],
+      });
+      if (allowance >= amountNeeded) return;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(
+      `Approval for ${token} did not become visible after ${attempts}s; ` +
+        `the RPC endpoints may be out of sync. Nothing was lost — retry.`,
+    );
   }
 
   private tokenForDirection(zeroForOne: boolean): Address {

@@ -74,6 +74,25 @@ export interface OptimizerConfig {
  * over from `results/<label>/lp-optimization.csv` (`range_pct`,
  * `recenter_buffer_pct`); they are converted to ticks at load time.
  */
+export interface ContractAddresses {
+  /** Uniswap V3 NonfungiblePositionManager. */
+  positionManager: `0x${string}`;
+  /** SwapRouter02. */
+  swapRouter: `0x${string}`;
+  /** QuoterV2. */
+  quoter: `0x${string}`;
+  /** Aave V3 Pool. */
+  aavePool: `0x${string}`;
+}
+
+/** Base mainnet deployments. */
+export const BASE_CONTRACTS: ContractAddresses = {
+  positionManager: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
+  swapRouter: "0x2626664c2603336E57B271c5C0b26F421741e481",
+  quoter: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+  aavePool: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+};
+
 export interface LpRebalanceConfig {
   /** Half-width of the managed range, in ticks. */
   widthTicks: number;
@@ -128,6 +147,12 @@ export interface LpRebalanceConfig {
 
 export interface AppConfig {
   mode: Mode;
+  /**
+   * Contract addresses, resolved once here so every executor honours the same
+   * overrides. Defaults are the Base mainnet deployments; set the matching
+   * env var to point at another chain or a fork.
+   */
+  contracts: ContractAddresses;
   rpcUrls: string[];
   privateKey: `0x${string}` | null;
   walletAddress: `0x${string}` | null;
@@ -252,6 +277,14 @@ function key(): `0x${string}` | null {
  * private keys or RPC endpoints.
  */
 export function loadConfig(mode: Mode): AppConfig {
+  const contracts: ContractAddresses = {
+    positionManager: (env("POSITION_MANAGER_ADDRESS") ??
+      BASE_CONTRACTS.positionManager) as `0x${string}`,
+    swapRouter: (env("SWAP_ROUTER_ADDRESS") ?? BASE_CONTRACTS.swapRouter) as `0x${string}`,
+    quoter: (env("QUOTER_ADDRESS") ?? BASE_CONTRACTS.quoter) as `0x${string}`,
+    aavePool: (env("AAVE_POOL") ?? BASE_CONTRACTS.aavePool) as `0x${string}`,
+  };
+
   const cfg: AppConfig = {
     mode,
     rpcUrls: (env("RPC_URL") ?? "https://mainnet.base.org")
@@ -269,6 +302,7 @@ export function loadConfig(mode: Mode): AppConfig {
     lendBufferUsdc: num("LEND_BUFFER_USDC", 0),
     minPoolTvlUsd: num("LP_MIN_POOL_TVL_USD", 0),
     runLabel: env("RUN_LABEL") ?? mode,
+    contracts,
     pollIntervalSeconds: num("POLL_INTERVAL_SECONDS", 30),
     estimatedGasUsd: num("ESTIMATED_GAS_USD", 0.02),
     gas: {
@@ -279,7 +313,7 @@ export function loadConfig(mode: Mode): AppConfig {
     lendingGasLegs: bool("GAS_LENDING_LEGS", false),
     // Aave lending of idle liquidity (defaults = official Base deployments)
     lendingEnabled: (env("ENABLE_AAVE") ?? "false").toLowerCase() === "true",
-    aavePool: (env("AAVE_POOL") ?? "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5") as `0x${string}`,
+    aavePool: contracts.aavePool,
     aUsdc: (env("A_USDC") ?? "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB") as `0x${string}`,
     aWeth: (env("A_WETH") ?? "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7") as `0x${string}`,
     // Buffers default to ZERO: all idle assets are lent. Grid fills
@@ -354,12 +388,9 @@ export function loadConfig(mode: Mode): AppConfig {
         rangePct,
         recenterBufferPct: bufferPct,
         recenterMinHours: num("LP_RECENTER_MIN_HOURS", 24),
-        positionManagerAddress: (env("POSITION_MANAGER_ADDRESS") ??
-          "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1") as `0x${string}`,
-        swapRouterAddress: (env("SWAP_ROUTER_ADDRESS") ??
-          "0x2626664c2603336E57B271c5C0b26F421741e481") as `0x${string}`,
-        quoterAddress: (env("QUOTER_ADDRESS") ??
-          "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a") as `0x${string}`,
+        positionManagerAddress: contracts.positionManager,
+        swapRouterAddress: contracts.swapRouter,
+        quoterAddress: contracts.quoter,
         slippageBps: num("LP_SLIPPAGE_BPS", 50),
         positionId: BigInt(Math.trunc(num("POSITION_ID", 0))),
         stateFile: env("STATE_FILE") ?? "state/position.json",

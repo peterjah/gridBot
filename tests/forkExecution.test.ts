@@ -5,6 +5,7 @@ import { createClient } from "../src/blockchain/client.js";
 import type { BotClient } from "../src/blockchain/client.js";
 import { createTransactor } from "../src/blockchain/wallet.js";
 import type { AppConfig } from "../src/config.js";
+import { BASE_CONTRACTS } from "../src/config.js";
 import { UniswapV3Executor } from "../src/execution/uniswapExecutor.js";
 import { AaveExecutor } from "../src/lending/aaveExecutor.js";
 import { getPoolInfo, getPoolState } from "../src/uniswap/pool.js";
@@ -66,15 +67,16 @@ describe.runIf(FORK_URL)("fork execution", () => {
       poolAddress: POOL_ADDRESS,
       csvFile: "",
       reportFile: "",
+      contracts: BASE_CONTRACTS,
       lpRebalance: {
         widthTicks: 488,
         thresholdTicks: 723,
         rangePct: 5,
         recenterBufferPct: 50,
         recenterMinHours: 24,
-        positionManagerAddress: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
-        swapRouterAddress: "0x2626664c2603336E57B271c5C0b26F421741e481",
-        quoterAddress: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+        positionManagerAddress: BASE_CONTRACTS.positionManager,
+        swapRouterAddress: BASE_CONTRACTS.swapRouter,
+        quoterAddress: BASE_CONTRACTS.quoter,
         slippageBps: 50,
         positionId: 0n,
         stateFile: "state/position.json",

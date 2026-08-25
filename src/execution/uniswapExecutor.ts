@@ -10,8 +10,8 @@ import { logger } from "../utils/logger.js";
 
 const MAX_UINT256 = (1n << 256n) - 1n;
 // Official Uniswap V3 deployments on Base
-const SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481" as Address;
-const QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address;
+// Resolved from config so this.swapRouter_ADDRESS / QUOTER_ADDRESS are honoured
+// here too, rather than only by the LP path.
 const BATCH_DEADLINE_SECONDS = 120n;
 
 export interface FillIntent {
@@ -43,6 +43,8 @@ export class UniswapV3Executor {
   private readonly wallet: Address;
   private readonly transactor: ReturnType<typeof createTransactor>;
   private readonly slippageBps: number;
+  private readonly swapRouter: Address;
+  private readonly quoter: Address;
 
   constructor(
     client: BotClient,
@@ -54,6 +56,8 @@ export class UniswapV3Executor {
     this.transactor = createTransactor(privateKey, cfg.rpcUrls);
     this.wallet = cfg.walletAddress ?? this.transactor.account.address;
     this.slippageBps = Math.max(cfg.grid.slippageBps, 50); // at least 0.5% on-chain
+    this.swapRouter = cfg.contracts.swapRouter;
+    this.quoter = cfg.contracts.quoter;
   }
 
   /** Buy ETH with roughly `quoteUsd` USDC. */
@@ -75,7 +79,7 @@ export class UniswapV3Executor {
     }
 
     const quotedOut = await quoteExactInputSingle(
-      this.client, QUOTER, usdc.address, weth.address, this.pool.fee, amountIn,
+      this.client, this.quoter, usdc.address, weth.address, this.pool.fee, amountIn,
     );
     const minOut = applySlippage(quotedOut, this.slippageBps);
     logger.debug("BUY: quote", {
@@ -86,7 +90,7 @@ export class UniswapV3Executor {
       impliedPrice: Number(formatUnits(amountIn, usdc.decimals)) / Number(formatUnits(quotedOut, weth.decimals)),
     });
 
-    await this.ensureApproval(usdc.address, SWAP_ROUTER, amountIn);
+    await this.ensureApproval(usdc.address, this.swapRouter, amountIn);
     const txHash = await this.swap(usdc.address, weth.address, amountIn, minOut);
 
     return {
@@ -116,7 +120,7 @@ export class UniswapV3Executor {
     }
 
     const quotedOut = await quoteExactInputSingle(
-      this.client, QUOTER, weth.address, usdc.address, this.pool.fee, amountIn,
+      this.client, this.quoter, weth.address, usdc.address, this.pool.fee, amountIn,
     );
     const minOut = applySlippage(quotedOut, this.slippageBps);
     logger.debug("SELL: quote", {
@@ -127,7 +131,7 @@ export class UniswapV3Executor {
       impliedPrice: Number(formatUnits(quotedOut, usdc.decimals)) / Number(formatUnits(amountIn, weth.decimals)),
     });
 
-    await this.ensureApproval(weth.address, SWAP_ROUTER, amountIn);
+    await this.ensureApproval(weth.address, this.swapRouter, amountIn);
     const txHash = await this.swap(weth.address, usdc.address, amountIn, minOut);
 
     return {
@@ -172,7 +176,7 @@ export class UniswapV3Executor {
     );
     const quotedOuts = await quoteExactInputSingleBatch(
       this.client,
-      QUOTER,
+      this.quoter,
       fills.map((fill, i) => ({
         tokenIn: fill.type === "BUY" ? usdc.address : weth.address,
         tokenOut: fill.type === "BUY" ? weth.address : usdc.address,
@@ -242,11 +246,11 @@ export class UniswapV3Executor {
       const allowances = await allowancesFor(
         this.client,
         this.wallet,
-        SWAP_ROUTER,
+        this.swapRouter,
         needed.map((n) => n.token),
       );
       for (const [i, n] of needed.entries()) {
-        if (allowances[i]! < n.amount) await this.approveMax(n.token, SWAP_ROUTER);
+        if (allowances[i]! < n.amount) await this.approveMax(n.token, this.swapRouter);
       }
     }
 
@@ -258,7 +262,7 @@ export class UniswapV3Executor {
       totalWeth: formatUnits(totalWethNeeded, weth.decimals),
       deadlineSeconds: BATCH_DEADLINE_SECONDS.toString(),
     });
-    const txHash = await this.transactor.send(this.client, "router-multicall", SWAP_ROUTER, data);
+    const txHash = await this.transactor.send(this.client, "router-multicall", this.swapRouter, data);
 
     return {
       results: results.map((r) => ({ ...r, txHash })),
@@ -280,7 +284,7 @@ export class UniswapV3Executor {
       amountIn,
       amountOutMinimum,
     });
-    return this.transactor.send(this.client, "exactInputSingle", SWAP_ROUTER, data);
+    return this.transactor.send(this.client, "exactInputSingle", this.swapRouter, data);
   }
 
   private async ensureApproval(token: Address, spender: Address, amountNeeded: bigint): Promise<void> {
