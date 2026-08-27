@@ -113,6 +113,8 @@ function harness(overrides: HarnessOptions = {}) {
     },
     null,
     30,
+    900,
+    120,
     pool,
     {
       name: "t",
@@ -266,6 +268,8 @@ describe("persisted re-centre cooldown", () => {
       { ...cfg, stateFile, dryRun: true, regimeMaxMovePct: 0, recenterMinHours: 24 },
       null,
       30,
+      900,
+      120,
       pool,
       { name: "t", shouldRebalance: () => true, computeRange: () => ({ lowerTick: 0, upperTick: 1 }) },
       lendingNoop(),

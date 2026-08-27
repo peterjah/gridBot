@@ -473,6 +473,44 @@ real funds. Keep `HEDGE_ENABLED=false` until that exists — and note that the
 walk-forward above says the regime filter alone outperforms filter-plus-hedge
 on the configuration the backtest can score.
 
+## Adaptive polling
+
+The bot's decisions are bounded by slow-moving thresholds: a re-centre needs
+price to travel hundreds of ticks, a re-entry needs a 168-hour trailing move to
+decay, and the cooldown can block action for a full day. Polling every 30
+seconds through all of that spends RPC quota re-reading a state that cannot have
+changed — which is exactly how a paid endpoint's monthly allowance disappears.
+
+`POLL_INTERVAL_SECONDS` is now the **floor**, not the interval. The bot polls
+that fast only when something is close to acting, and otherwise backs off
+toward `MAX_POLL_INTERVAL_SECONDS` (default 900).
+
+At roughly three RPC calls per cycle:
+
+| situation | interval | calls/day |
+| --- | --- | --- |
+| parked, ETH +30% over the week | 835s | 310 |
+| parked, move decayed to 5% | 509s | 509 |
+| parked, about to re-enter (2.3%) | 49s | 5,290 |
+| deployed, sitting at centre | 610s | 425 |
+| deployed, halfway to the trigger | 467s | 555 |
+| deployed, near the trigger | 58s | 4,469 |
+| deployed, 20h of cooldown left | 900s | 288 |
+| *fixed 30s (previous behaviour)* | *30s* | *8,640* |
+
+Two hard overrides sit above the urgency calculation:
+
+* **A blocking cooldown outranks it.** No amount of price movement can trigger a
+  re-centre until the cooldown expires, so the bot sleeps toward the expiry
+  rather than watching a trigger that cannot fire.
+* **An open short caps it** at `HEDGE_POLL_INTERVAL_SECONDS`, because
+  liquidation risk does not care how quiet the rest of the state looks.
+
+Nothing here can cause a missed action — the thresholds are unchanged and an
+over-long interval costs only latency at the moment of action. The policy is a
+pure function (`src/bot/polling.ts`) with the boundary behaviour pinned by
+tests.
+
 ## Operational notes from the first live run
 
 2026-08-25, Base, ~$41 of test capital. The strategy logic behaved correctly —

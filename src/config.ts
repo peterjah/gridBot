@@ -187,6 +187,17 @@ export interface AppConfig {
    */
   runLabel: string;
   pollIntervalSeconds: number;
+  /**
+   * Ceiling for the adaptive poll interval, seconds.
+   *
+   * POLL_INTERVAL_SECONDS is the floor — the fastest the bot polls when
+   * something is close to acting. When nothing is near a boundary it backs off
+   * toward this, because re-reading a state that cannot have changed is how a
+   * paid RPC allowance disappears.
+   */
+  maxPollIntervalSeconds: number;
+  /** Ceiling while a short is open, so the health factor stays watched. */
+  hedgePollIntervalSeconds: number;
   /** Estimated gas per executed trade in USD (environment cost). */
   estimatedGasUsd: number;
   /**
@@ -335,6 +346,8 @@ export function loadConfig(mode: Mode): AppConfig {
     runLabel: env("RUN_LABEL") ?? mode,
     contracts,
     pollIntervalSeconds: num("POLL_INTERVAL_SECONDS", 30),
+    maxPollIntervalSeconds: num("MAX_POLL_INTERVAL_SECONDS", 900),
+    hedgePollIntervalSeconds: num("HEDGE_POLL_INTERVAL_SECONDS", 120),
     estimatedGasUsd: num("ESTIMATED_GAS_USD", 0.02),
     gas: {
       txOverheadUsd: num("GAS_TX_OVERHEAD_USD", 0),

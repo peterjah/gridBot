@@ -68,6 +68,8 @@ describe.runIf(FORK_URL)("fork execution", () => {
       csvFile: "",
       reportFile: "",
       contracts: BASE_CONTRACTS,
+      maxPollIntervalSeconds: 900,
+      hedgePollIntervalSeconds: 120,
       hedgeBorrowAprPct: 3,
       hedgeMinHealthFactor: 1.6,
       lpRebalance: {

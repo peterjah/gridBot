@@ -25,7 +25,13 @@ services:
       LP_RECENTER_BUFFER_PCT: "${LP_RECENTER_BUFFER_PCT:-50}"
       LP_RECENTER_MIN_HOURS: "${LP_RECENTER_MIN_HOURS:-24}"
       LP_SLIPPAGE_BPS: "${LP_SLIPPAGE_BPS:-50}"
+      # Adaptive polling. POLL_INTERVAL_SECONDS is the FLOOR, used when
+      # something is close to acting; the interval backs off toward
+      # MAX_POLL_INTERVAL_SECONDS when nothing is near a boundary. Parked far
+      # from re-entry drops from ~8,600 to ~310 calls/day.
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
+      MAX_POLL_INTERVAL_SECONDS: "${MAX_POLL_INTERVAL_SECONDS:-900}"
+      HEDGE_POLL_INTERVAL_SECONDS: "${HEDGE_POLL_INTERVAL_SECONDS:-120}"
 
       # --- regime filter -------------------------------------------------
       # Off by default. Walk-forward loses money in 3 of 4 out-of-sample folds

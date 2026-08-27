@@ -17,6 +17,7 @@ import type { Strategy } from "../strategy/rebalance.js";
 import { RebalanceExecutor } from "./rebalanceExecutor.js";
 import type { LpLendingManager } from "../lp/lpLending.js";
 import type { AaveShortHedge } from "../lp/hedge.js";
+import { nextPollSeconds } from "./polling.js";
 import { sqrtRatioToPrice } from "../utils/math.js";
 import { logger } from "../utils/logger.js";
 
@@ -25,6 +26,16 @@ const MAX_BACKOFF_SECONDS = 900;
 export class Monitor {
   private readonly executor: RebalanceExecutor;
   private consecutiveFailures = 0;
+  /**
+   * What the last cycle observed, so the next interval can be chosen from it.
+   * Null until the first cycle completes; the first sleep uses the ceiling.
+   */
+  private lastObservation: {
+    distanceTicks: number | null;
+    trailingMovePct: number | null;
+    parked: boolean;
+    hedgeOpen: boolean;
+  } | null = null;
   private lastRecenterAt: number;
 
   constructor(
@@ -33,6 +44,10 @@ export class Monitor {
     private readonly config: LpRebalanceConfig,
     private readonly walletAddress: Address | null,
     private readonly pollIntervalSeconds: number,
+    /** Ceiling for the adaptive interval when nothing is near a boundary. */
+    private readonly maxPollIntervalSeconds: number,
+    /** Ceiling while a short is open, so the health factor stays watched. */
+    private readonly hedgePollIntervalSeconds: number,
     private readonly pool: PoolInfo,
     private readonly strategy: Strategy,
     /** Optional: lends idle capital while the bot stands aside. */
@@ -115,8 +130,48 @@ export class Monitor {
         await sleep(backoffSeconds * 1000);
         continue;
       }
-      await sleep(this.pollIntervalSeconds * 1000);
+      await sleep(this.nextInterval() * 1000);
     }
+  }
+
+  /**
+   * Seconds to wait before the next cycle.
+   *
+   * `pollIntervalSeconds` is the FLOOR: the fastest the bot will ever poll,
+   * used when something is close to acting. When nothing is near a boundary it
+   * backs off toward `maxPollIntervalSeconds`, because re-reading a state that
+   * cannot have changed spends RPC quota for nothing.
+   */
+  private nextInterval(): number {
+    const o = this.lastObservation;
+    const decision = nextPollSeconds({
+      minSeconds: this.pollIntervalSeconds,
+      maxSeconds: Math.max(this.maxPollIntervalSeconds, this.pollIntervalSeconds),
+      distanceTicks: o?.distanceTicks ?? null,
+      thresholdTicks: this.config.thresholdTicks,
+      cooldownRemainingSeconds: this.cooldownRemainingSeconds(),
+      trailingMovePct: o?.trailingMovePct ?? null,
+      regimeMaxMovePct: this.config.regimeMaxMovePct,
+      regimeReenterMaxPct:
+        this.config.regimeMaxMovePct * (1 - this.config.regimeReenterMarginPct / 100),
+      parked: o?.parked ?? false,
+      hedgeOpen: o?.hedgeOpen ?? false,
+      hedgeMaxSeconds: this.hedgePollIntervalSeconds,
+    });
+    logger.debug("Next poll", {
+      seconds: decision.seconds,
+      reason: decision.reason,
+      urgency: Number(decision.urgency.toFixed(2)),
+    });
+    return decision.seconds;
+  }
+
+  /** Seconds until a re-centre is allowed again; 0 when it is not blocking. */
+  private cooldownRemainingSeconds(): number {
+    if (this.config.recenterMinHours <= 0) return 0;
+    const elapsedMs = Date.now() - this.lastRecenterAt;
+    const remainingMs = this.config.recenterMinHours * 3600_000 - elapsedMs;
+    return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0;
   }
 
   async cycle(): Promise<void> {
@@ -207,6 +262,15 @@ export class Monitor {
       rebalanceDecision: decision ? "REBALANCE" : "HOLD",
       dryRun: this.config.dryRun,
     });
+
+    // Remember what this cycle saw, so the next interval can be chosen from a
+    // real observation rather than a fixed guess.
+    this.lastObservation = {
+      distanceTicks: distance,
+      trailingMovePct: move,
+      parked: hostile || persisted.parked,
+      hedgeOpen: this.hedge !== null && (await this.hedge.isOpen()),
+    };
 
     // A hostile regime overrides everything: close to cash and stay there.
     // The dwell time is the same one that rate-limits re-centring, so the

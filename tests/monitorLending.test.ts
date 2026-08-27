@@ -70,6 +70,8 @@ function harness(overrides: { hostile?: boolean } = {}) {
     { ...cfg, stateFile, regimeMaxMovePct: overrides.hostile ? 1 : 0 },
     null,
     30,
+    900,
+    120,
     pool,
     {
       name: "t",
