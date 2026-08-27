@@ -391,10 +391,43 @@ whether this strategy works.
 
 ## Hedge safety and liquidation risk
 
-`HEDGE_ENABLED=true` borrows WETH against supplied collateral while the bot is
-parked and sells it, so the parked book is flat against ETH rather than merely
-uninvested. Borrowing introduces a liquidation risk the bot did not previously
-have. What guards it:
+**`HEDGE_ENABLED` is off, and should stay off in its current form.**
+
+It borrows WETH against supplied collateral while the bot is parked and sells
+it, so the parked book is flat against ETH rather than merely uninvested. That
+works, but it is the wrong tool for this particular job.
+
+While parked, the ETH is loose tokens. Selling them reaches a flat book in one
+step. The hedge instead supplies that same WETH as collateral and borrows it
+back to cancel it out:
+
+| | ETH exposure |
+| --- | --- |
+| supplied X WETH | +X |
+| borrowed Y WETH | −Y |
+| USDC from the sale | 0 |
+| **net** | **X − Y** |
+
+Setting Y = X is flat — and so is simply holding no WETH. Both paths cost the
+same two swaps (out, and back on re-entry, which `rebalance` performs anyway).
+The borrow path adds three transactions, a permanent borrow-minus-supply rate
+spread, and liquidation risk, for no additional hedging.
+
+A borrow earns its keep only against exposure that **cannot be sold** — the LP
+position's own delta while deployed, where selling means withdrawing and
+defeats the point. The shipped hedge covers the parked leg instead, which is
+exactly the case that does not need it. That is also why the backtest scores it
+at zero: the parked book in the model is all USDC, so there is nothing to
+short.
+
+Walk-forward agrees on the numbers: the regime filter alone averages +3.6% out
+of sample against +0.2% for filter-plus-hedge.
+
+The guards below are sound and are kept, so the machinery is ready if the hedge
+is ever moved to the deployed leg — the case worth having, which moved the four
+folds from −7.8% to −3.7% mean and halved the worst one.
+
+### Guards, if it is enabled anyway
 
 **The de-leverage ordering.** The debt is repaid before any collateral is
 withdrawn. `hedge.close()` runs first in the deploy path, then

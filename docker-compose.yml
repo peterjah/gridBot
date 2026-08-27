@@ -45,6 +45,20 @@ services:
       ENABLE_AAVE: "${ENABLE_AAVE:-false}"
       LEND_MIN_ACTION_USD: "${LEND_MIN_ACTION_USD:-100}"
 
+      # --- short hedge: OFF ----------------------------------------------
+      # Borrows WETH against collateral and sells it, to hold the parked book
+      # flat against ETH. Off because it is the wrong tool for that job: while
+      # parked the ETH is loose tokens that can simply be SOLD, which reaches
+      # the same flat book without a borrow, a rate spread, or liquidation
+      # risk. A borrow only earns its keep against exposure that cannot be
+      # sold — the LP position's delta while deployed — which this does not
+      # cover. Walk-forward also puts filter-plus-hedge (+0.2% mean) behind
+      # the regime filter alone (+3.6%). See docs/LP_REBALANCE.md.
+      HEDGE_ENABLED: "${HEDGE_ENABLED:-false}"
+      HEDGE_RATIO_PCT: "${HEDGE_RATIO_PCT:-100}"
+      HEDGE_MAX_LTV_PCT: "${HEDGE_MAX_LTV_PCT:-40}"
+      HEDGE_MIN_HEALTH_FACTOR: "${HEDGE_MIN_HEALTH_FACTOR:-1.6}"
+
     volumes:
       # Position id, fee totals and the regime price window. Losing this means
       # losing track of the position and the whole fee measurement.
