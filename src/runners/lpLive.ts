@@ -37,7 +37,15 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
   }
 
   const client = createClient(cfg.rpcUrls);
-  const pool = await getPoolInfo(client, cfg.poolAddress!);
+  // Reading pool metadata is the first chain call, and a transient RPC problem
+  // here used to kill the process. Under `restart: unless-stopped` that turns
+  // a rate limit or an exhausted quota into a crash loop that re-runs the whole
+  // entrypoint — seed download included — every few seconds. Retry with
+  // backoff instead, the same way the monitor handles cycle failures.
+  const pool = await withBackoff(
+    () => getPoolInfo(client, cfg.poolAddress!),
+    "read pool metadata",
+  );
 
   const strategy = new CenteredRangeStrategy({
     widthTicks: lp.widthTicks,
@@ -207,6 +215,38 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
     hedge,
   );
   await monitor.run();
+}
+
+/**
+ * Retry a startup call with exponential backoff, capped and unbounded in
+ * attempts: the bot should wait out an RPC outage, not exit into a restart
+ * loop that repeats all of startup.
+ */
+async function withBackoff<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  const maxDelayMs = 5 * 60_000;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const delayMs = Math.min(5_000 * 2 ** Math.min(attempt - 1, 10), maxDelayMs);
+      const message =
+        (error instanceof Error ? error.message.split("\n")[0] : String(error)) ?? "unknown";
+      logger.error(`Startup: could not ${label}; retrying`, {
+        attempt,
+        retryingInSeconds: Math.round(delayMs / 1000),
+        error: message,
+        ...(/capacity|rate limit|429|quota/i.test(message)
+          ? {
+              hint:
+                "RPC quota or rate limit reached. RPC_URL accepts a " +
+                "comma-separated list and fails over across it — add a public " +
+                "endpoint so one exhausted provider cannot stop the bot.",
+            }
+          : {}),
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
 
 /** A transactor that can plan but refuses to sign. Dry-run only. */

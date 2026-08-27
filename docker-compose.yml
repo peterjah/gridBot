@@ -34,6 +34,9 @@ services:
       LP_REGIME_LOOKBACK_HOURS: "${LP_REGIME_LOOKBACK_HOURS:-168}"
       LP_REGIME_SAMPLE_MINUTES: "${LP_REGIME_SAMPLE_MINUTES:-60}"
       SEED_DAYS: "${SEED_DAYS:-30}"
+      # Reuse a seed younger than this instead of re-downloading. Stops a
+      # crash loop from hammering the data source on every restart.
+      SEED_MAX_AGE_SECONDS: "${SEED_MAX_AGE_SECONDS:-3600}"
 
       # --- Aave lending of idle capital ----------------------------------
       # The regime filter stands aside most of the time; lending recovers

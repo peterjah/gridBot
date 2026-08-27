@@ -61,7 +61,19 @@ fi
 case "$REGIME_MAX_MOVE_PCT" in
   0|0.0|"") log "Regime filter: OFF" ;;
   *)
-    if [ "$FETCH_SEED" = "1" ]; then
+    # Skip the download when the existing seed is still fresh. Without this a
+    # crash loop re-downloads ~9000 rows from Binance on every restart, which
+    # hammers them for no benefit and buries the actual error in the log.
+    SEED_FRESH=0
+    if [ -f "$LP_SEED_FILE" ]; then
+      SEED_AGE=$(( $(date +%s) - $(stat -c %Y "$LP_SEED_FILE" 2>/dev/null || echo 0) ))
+      if [ "$SEED_AGE" -lt "${SEED_MAX_AGE_SECONDS:-3600}" ]; then
+        SEED_FRESH=1
+        log "Seed is ${SEED_AGE}s old; reusing it"
+      fi
+    fi
+
+    if [ "$FETCH_SEED" = "1" ] && [ "$SEED_FRESH" = "0" ]; then
       NEED_DAYS=$(( (LP_REGIME_LOOKBACK_HOURS + 23) / 24 + 2 ))
       [ "$SEED_DAYS" -ge "$NEED_DAYS" ] || SEED_DAYS="$NEED_DAYS"
       FROM=$(node -e "process.stdout.write(new Date(Date.now()-$SEED_DAYS*864e5).toISOString().slice(0,10))")
@@ -72,7 +84,7 @@ case "$REGIME_MAX_MOVE_PCT" in
       ./node_modules/.bin/tsx scripts/fetchPrices.ts \
         --symbol "${SEED_SYMBOL:-ETHUSDT}" --interval 5m --from "$FROM" --out "$LP_SEED_FILE" \
         || log "warning: seed fetch failed; the regime filter will start blind"
-    else
+    elif [ "$FETCH_SEED" != "1" ]; then
       log "FETCH_SEED=0: not refreshing the seed"
     fi
     log "Regime filter: stand aside above ${REGIME_MAX_MOVE_PCT}% over ${LP_REGIME_LOOKBACK_HOURS}h"
