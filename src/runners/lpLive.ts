@@ -184,6 +184,7 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
         ratioPct: cfg.hedgeRatioPct,
         maxLtvPct: cfg.hedgeMaxLtvPct,
         minActionUsd: cfg.lendMinActionUsd,
+        minHealthFactor: cfg.hedgeMinHealthFactor,
         dryRun: lp.dryRun,
       }, cfg.walletAddress);
     }

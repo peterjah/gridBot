@@ -229,6 +229,11 @@ export interface AppConfig {
   hedgeRatioPct: number;
   /** Hard safety cap on borrowed value vs supplied collateral, percent. */
   hedgeMaxLtvPct: number;
+  /**
+   * Unwind the hedge when Aave's health factor reaches this. Liquidation is
+   * at 1.0; the default leaves room for an oracle move plus the unwind itself.
+   */
+  hedgeMinHealthFactor: number;
 
   // --- soak reporting ---
   soakLogFile: string;
@@ -356,6 +361,7 @@ export function loadConfig(mode: Mode): AppConfig {
     hedgeEnabled: bool("HEDGE_ENABLED", false),
     hedgeRatioPct: num("HEDGE_RATIO_PCT", 50),
     hedgeMaxLtvPct: num("HEDGE_MAX_LTV_PCT", 40),
+    hedgeMinHealthFactor: num("HEDGE_MIN_HEALTH_FACTOR", 1.6),
     soakLogFile: env("SOAK_LOG_FILE") ?? "paper.log",
     soakDays: Math.trunc(num("SOAK_DAYS", 0)),
     grid: {

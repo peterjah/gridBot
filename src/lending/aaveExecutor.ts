@@ -64,6 +64,20 @@ const poolAbi = [
     outputs: [{ type: "uint256" }],
   },
   {
+    name: "getUserAccountData",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "user", type: "address" }],
+    outputs: [
+      { name: "totalCollateralBase", type: "uint256" },
+      { name: "totalDebtBase", type: "uint256" },
+      { name: "availableBorrowsBase", type: "uint256" },
+      { name: "currentLiquidationThreshold", type: "uint256" },
+      { name: "ltv", type: "uint256" },
+      { name: "healthFactor", type: "uint256" },
+    ],
+  },
+  {
     name: "borrow",
     type: "function",
     stateMutability: "nonpayable",
@@ -338,9 +352,69 @@ export class AaveExecutor {
   }
 
   /** Borrow `amountHuman` of an asset at variable rate against collateral. */
+  /**
+   * Aave's own view of the account, in its base currency (8 decimals, USD).
+   *
+   * This is the authority on liquidation risk: it uses Aave's oracle prices
+   * and the live liquidation threshold for the actual collateral mix. Any LTV
+   * the bot computes from pool prices is an estimate that can disagree.
+   *
+   * `healthFactor` is 1e18-scaled and returns uint256 max when there is no
+   * debt; below 1.0 the position is liquidatable.
+   */
+  async accountData(): Promise<{
+    collateralUsd: number;
+    debtUsd: number;
+    liquidationThresholdPct: number;
+    ltvPct: number;
+    healthFactor: number;
+  }> {
+    const d = await this.client.readContract({
+      address: this.poolAddress,
+      abi: poolAbi,
+      functionName: "getUserAccountData",
+      args: [this.wallet],
+    });
+    const collateralUsd = Number(formatUnits(d[0], 8));
+    const debtUsd = Number(formatUnits(d[1], 8));
+    // Cap the "no debt" sentinel so callers can compare numerically.
+    const hfRaw = d[5];
+    const healthFactor =
+      hfRaw > 10n ** 40n ? Number.POSITIVE_INFINITY : Number(formatUnits(hfRaw, 18));
+    return {
+      collateralUsd,
+      debtUsd,
+      liquidationThresholdPct: Number(d[3]) / 100,
+      ltvPct: Number(d[4]) / 100,
+      healthFactor,
+    };
+  }
+
+  /** Borrow an exact raw amount. Returns the amount requested. */
+  async borrowRaw(assetName: "USDC" | "WETH", amountRaw: bigint): Promise<bigint> {
+    const a = this.asset(assetName);
+    if (amountRaw <= 0n) {
+      logger.debug("Aave: borrow skipped (zero amount)", { asset: assetName });
+      return 0n;
+    }
+    const data = encodeFunctionData({
+      abi: poolAbi,
+      functionName: "borrow",
+      args: [a.underlying, amountRaw, INTEREST_RATE_MODE_VARIABLE, 0, this.wallet],
+    });
+    logger.info("Aave: borrowing", {
+      asset: assetName,
+      amount: formatUnits(amountRaw, a.decimals),
+    });
+    await this.transactor.send(this.client, "aave-borrow", this.pool, data);
+    return amountRaw;
+  }
+
   async borrow(assetName: "USDC" | "WETH", amountHuman: number): Promise<void> {
     const a = this.asset(assetName);
-    const amountRaw = BigInt(Math.floor(amountHuman * 10 ** a.decimals));
+    // parseUnits, not float multiplication: 18-decimal amounts are far beyond
+    // MAX_SAFE_INTEGER and the round trip can round up past what is available.
+    const amountRaw = parseUnits(amountHuman.toFixed(a.decimals), a.decimals);
     if (amountRaw <= 0n) {
       logger.debug("Aave: borrow skipped (zero amount)", { asset: assetName, amountHuman });
       return;

@@ -1,5 +1,5 @@
 import type { Address } from "viem";
-import { encodeFunctionData, erc20Abi, formatUnits } from "viem";
+import { encodeFunctionData, erc20Abi, formatUnits, parseUnits } from "viem";
 import type { AaveExecutor } from "../lending/aaveExecutor.js";
 import type { BotClient } from "../blockchain/client.js";
 import type { Transactor } from "../blockchain/wallet.js";
@@ -37,6 +37,17 @@ export interface HedgeOptions {
   maxLtvPct: number;
   /** Skip the whole hedge when the notional is below this; gas is not worth it. */
   minActionUsd: number;
+  /**
+   * Unwind the hedge when Aave's health factor falls to this.
+   *
+   * Liquidation happens at 1.0. The regime filter keeps the bot parked
+   * precisely while a large move is running, and a short loses as ETH rises,
+   * so "parked" and "approaching liquidation" are correlated states rather
+   * than independent ones. Nothing else closes the hedge until the market
+   * calms, so without this check a sustained rally can run it into
+   * liquidation while the bot sits and watches.
+   */
+  minHealthFactor: number;
   /** Plan and log without broadcasting. */
   dryRun: boolean;
 }
@@ -150,8 +161,14 @@ export class AaveShortHedge {
     // until the collateral is readable before borrowing.
     await this.awaitCollateralVisible();
 
-    await this.aave.borrow("WETH", notionalEth);
-    const borrowedRaw = BigInt(Math.floor(notionalEth * 10 ** this.pool.token0.decimals));
+    // Borrow a raw amount and sell exactly that. Recomputing the raw figure
+    // from the same float independently could ask the swap for more WETH than
+    // the borrow actually delivered.
+    const borrowedRaw = parseUnits(
+      notionalEth.toFixed(this.pool.token0.decimals),
+      this.pool.token0.decimals,
+    );
+    await this.aave.borrowRaw("WETH", borrowedRaw);
     // Sell everything just borrowed. The quote-based slippage floor protects
     // execution; there is no hard out-amount to preserve here.
     await this.swap(
@@ -194,6 +211,15 @@ export class AaveShortHedge {
     // the wallet and rejoins the next deployment.
     const surplusFactor = 1.01;
     const usdcIn = BigInt(Math.ceil(debtEth * price * surplusFactor * 10 ** this.pool.token1.decimals));
+
+    // The USDC this hedge raised when it opened does not stay in the wallet:
+    // `parkIdle` runs on every hostile cycle and supplies the whole wallet
+    // balance to Aave, proceeds included. Without this the buy-back swaps
+    // USDC the wallet no longer holds, reverts, and — because close() errors
+    // propagate to block deployment — the bot can never re-enter while the
+    // debt sits open accruing interest.
+    await this.ensureBuybackFunds(usdcIn);
+
     // Hard floor: never accept fewer WETH back than the debt itself.
     await this.swap(
       this.pool.token1.address,
@@ -206,6 +232,89 @@ export class AaveShortHedge {
     const remaining = await this.aave.debtBalanceRaw("WETH");
     await this.aave.repayExact("WETH", remaining > debtRaw ? debtRaw : remaining);
     this.markHedged(false);
+    return true;
+  }
+
+  /**
+   * Make sure the wallet holds `usdcNeeded` before the buy-back, withdrawing
+   * the shortfall from Aave collateral.
+   *
+   * Withdrawing collateral while debt is open RAISES the LTV, so this is
+   * deliberately the minimum needed rather than everything: the full
+   * `releaseAll` only runs after the debt is repaid.
+   */
+  private async ensureBuybackFunds(usdcNeeded: bigint): Promise<void> {
+    const raw = await this.aave.allBalancesRaw();
+    if (raw.usdcWallet >= usdcNeeded) return;
+
+    const shortfall = usdcNeeded - raw.usdcWallet;
+    if (raw.usdcLent <= 0n) {
+      throw new Error(
+        `Hedge buy-back needs ${formatUnits(usdcNeeded, this.pool.token1.decimals)} USDC, ` +
+          `wallet holds ${formatUnits(raw.usdcWallet, this.pool.token1.decimals)} and no USDC ` +
+          `is supplied to withdraw. Repay the WETH debt manually before restarting.`,
+      );
+    }
+
+    const toWithdraw = shortfall > raw.usdcLent ? raw.usdcLent : shortfall;
+    logger.info("Withdrawing collateral to fund the hedge buy-back", {
+      needed: formatUnits(usdcNeeded, this.pool.token1.decimals),
+      inWallet: formatUnits(raw.usdcWallet, this.pool.token1.decimals),
+      withdrawing: formatUnits(toWithdraw, this.pool.token1.decimals),
+    });
+    await this.aave.withdrawRaw("USDC", toWithdraw);
+
+    // Withdrawing against open debt moves the health factor the wrong way.
+    // Surface where it landed rather than discovering it at liquidation.
+    const after = await this.aave.accountData();
+    logger.info("Health factor after funding withdrawal", {
+      healthFactor: Number.isFinite(after.healthFactor) ? after.healthFactor.toFixed(3) : "no debt",
+      collateralUsd: after.collateralUsd.toFixed(2),
+      debtUsd: after.debtUsd.toFixed(2),
+    });
+    if (after.healthFactor < 1.05) {
+      logger.error("Health factor critical after funding the buy-back", {
+        healthFactor: after.healthFactor.toFixed(3),
+      });
+    }
+  }
+
+  /**
+   * Liquidation guard, run every cycle while the hedge is open.
+   *
+   * A short loses as ETH rises, and the regime filter keeps the bot parked
+   * exactly while a large move runs — so "still parked" and "health factor
+   * degrading" are the same market, not independent events. Nothing else
+   * unwinds the hedge until the market calms, which may be never.
+   *
+   * Returns true if it unwound.
+   */
+  async checkHealth(): Promise<boolean> {
+    if (!(await this.isOpen())) return false;
+
+    const data = await this.aave.accountData();
+    const healthy = data.healthFactor >= this.options.minHealthFactor;
+
+    logger.info("Hedge health", {
+      healthFactor: Number.isFinite(data.healthFactor) ? data.healthFactor.toFixed(3) : "no debt",
+      minHealthFactor: this.options.minHealthFactor,
+      collateralUsd: data.collateralUsd.toFixed(2),
+      debtUsd: data.debtUsd.toFixed(2),
+      liquidationThresholdPct: data.liquidationThresholdPct,
+      verdict: healthy ? "OK" : "UNWIND",
+    });
+
+    if (healthy) return false;
+
+    logger.warn("Health factor below floor — unwinding the hedge early", {
+      healthFactor: data.healthFactor.toFixed(3),
+      minHealthFactor: this.options.minHealthFactor,
+    });
+    if (this.options.dryRun) {
+      logger.info("[DRY RUN] Would unwind the hedge on health");
+      return true;
+    }
+    await this.close();
     return true;
   }
 

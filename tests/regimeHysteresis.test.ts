@@ -53,6 +53,8 @@ interface HarnessOptions {
   parked?: boolean;
   lastRecenterAtSecondsAgo?: number;
   hedgeOpen?: boolean;
+  /** Force the liquidation guard to report an unwind. */
+  hedgeUnhealthy?: boolean;
   /** Managed position id; null keeps the bootstrap-mint path. */
   positionId?: bigint | null;
 }
@@ -82,6 +84,12 @@ function harness(overrides: HarnessOptions = {}) {
   const lending = lendingNoop(order);
   const hedge = {
     isOpen: async () => overrides.hedgeOpen ?? false,
+    // The liquidation guard runs before open() on every parked cycle. Healthy
+    // by default: tests that care about unwinding drive it explicitly.
+    checkHealth: async () => {
+      order.push("hedge.checkHealth");
+      return overrides.hedgeUnhealthy ?? false;
+    },
     open: async () => {
       order.push("hedge.open");
       return true;
@@ -267,5 +275,26 @@ describe("persisted re-centre cooldown", () => {
     await mockPoolReads(42n);
     await again.cycle();
     expect(order2).not.toContain("rebalance");
+  });
+
+  /**
+   * The liquidation guard must run before open(), and an unwind must not be
+   * followed by re-opening into the very conditions that forced it: the
+   * regime is still hostile, so the next attempt would rebuild the same
+   * position at a worse health factor.
+   */
+  it("checks health before opening, and does not re-open after an unwind", async () => {
+    const { monitor, order } = harness({ movePct: 5, hedgeOpen: true, hedgeUnhealthy: true });
+    await mockPoolReads(null);
+    await monitor.cycle();
+    expect(order).toContain("hedge.checkHealth");
+    expect(order).not.toContain("hedge.open");
+  });
+
+  it("opens only after a healthy check", async () => {
+    const { monitor, order } = harness({ movePct: 5 });
+    await mockPoolReads(null);
+    await monitor.cycle();
+    expect(order.indexOf("hedge.checkHealth")).toBeLessThan(order.indexOf("hedge.open"));
   });
 });

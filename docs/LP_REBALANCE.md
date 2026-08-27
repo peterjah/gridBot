@@ -389,6 +389,57 @@ digits, and the bot only earns it while parked. On a $10,000 account parked 65%
 of the time at 3% APR that is roughly $195/year — real, but not what decides
 whether this strategy works.
 
+## Hedge safety and liquidation risk
+
+`HEDGE_ENABLED=true` borrows WETH against supplied collateral while the bot is
+parked and sells it, so the parked book is flat against ETH rather than merely
+uninvested. Borrowing introduces a liquidation risk the bot did not previously
+have. What guards it:
+
+**The de-leverage ordering.** The debt is repaid before any collateral is
+withdrawn. `hedge.close()` runs first in the deploy path, then
+`lending.releaseAll()`, then the position is funded — so a live LP is never
+funded from a wallet that also owes WETH, and collateral is never pulled out
+from under an open debt. Errors propagate rather than being swallowed:
+deploying long while still short is worse than a delayed entry.
+
+**The health-factor guard.** `checkHealth()` reads Aave's own
+`getUserAccountData` — its oracle prices and the live liquidation threshold,
+not the bot's estimate from pool prices — on *every* parked cycle, and unwinds
+the hedge when the health factor reaches `HEDGE_MIN_HEALTH_FACTOR` (default
+1.6, against liquidation at 1.0).
+
+This guard is not optional decoration. A short loses as ETH rises, and the
+regime filter keeps the bot parked precisely while a large move is running:
+"still parked" and "health factor degrading" are the same market condition, not
+independent events. Nothing else closes the hedge until the market calms, which
+may be after liquidation. When the guard fires it unwinds and does **not**
+re-open on the same cycle, since the regime that forced the unwind is still
+present.
+
+**The opening cap.** `HEDGE_MAX_LTV_PCT` (default 40) caps borrowed value
+against supplied collateral, well inside Aave's own liquidation LTV. Only
+supplied assets count as collateral; idle wallet balances do not. Note this cap
+uses pool prices, so it is an estimate — the health factor above is the
+authority.
+
+**Funding the buy-back.** `parkIdle` supplies the whole wallet on every hostile
+cycle, including the USDC the hedge raised when it opened. `close()` therefore
+withdraws the shortfall from collateral before buying back — the minimum
+needed, not everything, because withdrawing against open debt raises the LTV.
+It logs the health factor after that withdrawal, and refuses with a clear
+message rather than reverting on-chain if nothing can fund it.
+
+**Recovery.** The chain decides whether a hedge exists: `isOpen()` reads the
+variable-debt balance rather than a local flag, so a crash mid-unwind is
+resolved by running the next cycle. Every leg is a plain single call.
+
+Still unproven: none of this has run on-chain. The guards have unit tests and
+the ordering is pinned by tests, but a borrow path deserves a fork test before
+real funds. Keep `HEDGE_ENABLED=false` until that exists — and note that the
+walk-forward above says the regime filter alone outperforms filter-plus-hedge
+on the configuration the backtest can score.
+
 ## Operational notes from the first live run
 
 2026-08-25, Base, ~$41 of test capital. The strategy logic behaved correctly —

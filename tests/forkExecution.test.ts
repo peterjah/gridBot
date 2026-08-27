@@ -69,6 +69,7 @@ describe.runIf(FORK_URL)("fork execution", () => {
       reportFile: "",
       contracts: BASE_CONTRACTS,
       hedgeBorrowAprPct: 3,
+      hedgeMinHealthFactor: 1.6,
       lpRebalance: {
         widthTicks: 488,
         thresholdTicks: 723,

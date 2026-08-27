@@ -251,9 +251,14 @@ export class Monitor {
       // failed hedge logs and retries next cycle, it never blocks parking.
       if (this.hedge !== null) {
         try {
-          await this.hedge.open(price);
+          // Liquidation guard FIRST. A short loses as ETH rises and the filter
+          // keeps the bot parked exactly while a big move runs, so the state
+          // that keeps the hedge open is the state that endangers it. If this
+          // unwinds, do not immediately re-open into the same conditions.
+          const unwound = await this.hedge.checkHealth();
+          if (!unwound) await this.hedge.open(price);
         } catch (error) {
-          logger.warn("Could not open short hedge", {
+          logger.warn("Short hedge: could not open or check health", {
             error: error instanceof Error ? error.message.split("\n")[0] : String(error),
           });
         }
