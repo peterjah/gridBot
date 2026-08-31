@@ -5,6 +5,7 @@ import type { Transactor } from "../blockchain/wallet.js";
 import type { PoolInfo } from "../uniswap/pool.js";
 import { getPoolState } from "../uniswap/pool.js";
 import { getPosition } from "../uniswap/position.js";
+import type { PositionInfo } from "../uniswap/position.js";
 import {
   loadPositionId,
   loadState,
@@ -18,6 +19,9 @@ import { RebalanceExecutor } from "./rebalanceExecutor.js";
 import type { LpLendingManager } from "../lp/lpLending.js";
 import type { AaveShortHedge } from "../lp/hedge.js";
 import { nextPollSeconds } from "./polling.js";
+import { shouldRedeployIdle } from "./idleCapital.js";
+import { getAmountsForLiquidity, getSqrtRatioAtTick } from "../utils/math.js";
+import { formatUnits } from "viem";
 import { sqrtRatioToPrice } from "../utils/math.js";
 import { logger } from "../utils/logger.js";
 
@@ -48,6 +52,10 @@ export class Monitor {
     private readonly maxPollIntervalSeconds: number,
     /** Ceiling while a short is open, so the health factor stays watched. */
     private readonly hedgePollIntervalSeconds: number,
+    /** Redeploy when idle capital reaches this percent of the position. */
+    private readonly idleRedeployPct: number,
+    /** Absolute floor for that check, USD. */
+    private readonly idleRedeployMinUsd: number,
     private readonly pool: PoolInfo,
     private readonly strategy: Strategy,
     /** Optional: lends idle capital while the bot stands aside. */
@@ -164,6 +172,87 @@ export class Monitor {
       urgency: Number(decision.urgency.toFixed(2)),
     });
     return decision.seconds;
+  }
+
+  /**
+   * Is there enough undeployed capital to justify re-centring?
+   *
+   * Counts the wallet AND anything supplied to Aave: `parkIdle` may have
+   * banked a deposit while the bot was standing aside, and `releaseAll` only
+   * withdraws at the moment it deploys.
+   */
+  private async idleCapitalWantsRedeploy(
+    position: PositionInfo,
+    sqrtPriceX96: bigint,
+    price: number,
+  ): Promise<boolean> {
+    let idleUsd: number;
+    try {
+      idleUsd = await this.idleValueUsd(price);
+    } catch (error) {
+      // Never let an accounting read stop the bot from holding.
+      logger.warn("Could not value idle capital", {
+        error: error instanceof Error ? error.message.split("\n")[0] : String(error),
+      });
+      return false;
+    }
+
+    const { amount0, amount1 } = getAmountsForLiquidity(
+      sqrtPriceX96,
+      getSqrtRatioAtTick(position.tickLower),
+      getSqrtRatioAtTick(position.tickUpper),
+      position.liquidity,
+    );
+    const deployedUsd =
+      Number(formatUnits(amount0, this.pool.token0.decimals)) * price +
+      Number(formatUnits(amount1, this.pool.token1.decimals));
+
+    const d = shouldRedeployIdle({
+      idleUsd,
+      deployedUsd,
+      thresholdPct: this.idleRedeployPct,
+      minUsd: this.idleRedeployMinUsd,
+    });
+    if (d.redeploy) {
+      logger.info("Redeploying idle capital", {
+        idleUsd: idleUsd.toFixed(2),
+        deployedUsd: deployedUsd.toFixed(2),
+        reason: d.reason,
+      });
+    } else {
+      logger.debug("Idle capital below the redeploy threshold", {
+        idleUsd: idleUsd.toFixed(2),
+        deployedUsd: deployedUsd.toFixed(2),
+        reason: d.reason,
+      });
+    }
+    return d.redeploy;
+  }
+
+  /** Wallet plus supplied balances, valued in USD. */
+  private async idleValueUsd(price: number): Promise<number> {
+    if (this.lending !== null) {
+      // One multicall covers wallet and supplied balances for both assets.
+      return this.lending.idleValueUsd(price);
+    }
+    const [eth, usdc] = await Promise.all([
+      this.client.readContract({
+        address: this.pool.token0.address,
+        abi: erc20Abi,
+        functionName: "balanceOf",
+        args: [this.wallet],
+      }),
+      this.client.readContract({
+        address: this.pool.token1.address,
+        abi: erc20Abi,
+        functionName: "balanceOf",
+        args: [this.wallet],
+      }),
+    ]);
+    return (
+      Number(formatUnits(eth, this.pool.token0.decimals)) * price +
+      Number(formatUnits(usdc, this.pool.token1.decimals))
+    );
   }
 
   /** Seconds until a re-centre is allowed again; 0 when it is not blocking. */
@@ -366,7 +455,18 @@ export class Monitor {
       }
     }
 
-    if (!decision) return;
+    // A position sitting quietly at its centre never re-centres, and only a
+    // re-centre moves capital — so a deposit made now would wait weeks and earn
+    // a money-market rate instead of pool fees. Treat enough idle capital as
+    // its own reason to re-centre, which redeploys everything.
+    let idleDecision = decision;
+    if (!decision && position && position.liquidity > 0n && this.cooledDown()) {
+      // Only checked when a re-centre could actually follow: behind the
+      // cooldown this would spend RPC calls on something that cannot act.
+      idleDecision = await this.idleCapitalWantsRedeploy(position, state.sqrtPriceX96, price);
+    }
+
+    if (!idleDecision) return;
 
     // The cooldown rate-limits re-centring, not the initial deployment: with
     // nothing in the pool there is no position to protect and every cycle

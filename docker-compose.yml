@@ -33,6 +33,12 @@ services:
       MAX_POLL_INTERVAL_SECONDS: "${MAX_POLL_INTERVAL_SECONDS:-900}"
       HEDGE_POLL_INTERVAL_SECONDS: "${HEDGE_POLL_INTERVAL_SECONDS:-120}"
 
+      # Absorb deposits. Only a re-centre moves capital, so without this a
+      # top-up made while the position sits at its centre waits weeks and
+      # earns a money-market rate instead of pool fees.
+      IDLE_REDEPLOY_PCT: "${IDLE_REDEPLOY_PCT:-5}"
+      IDLE_REDEPLOY_MIN_USD: "${IDLE_REDEPLOY_MIN_USD:-50}"
+
       # --- regime filter -------------------------------------------------
       # Off by default. Walk-forward loses money in 3 of 4 out-of-sample folds
       # without it; see docs/LP_REBALANCE.md before changing this.

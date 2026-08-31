@@ -72,6 +72,8 @@ function harness(overrides: { hostile?: boolean } = {}) {
     30,
     900,
     120,
+    5,
+    50,
     pool,
     {
       name: "t",

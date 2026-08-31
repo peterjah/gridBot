@@ -55,6 +55,8 @@ interface HarnessOptions {
   hedgeOpen?: boolean;
   /** Force the liquidation guard to report an unwind. */
   hedgeUnhealthy?: boolean;
+  /** What the strategy says about distance; false means "holding". */
+  shouldRebalance?: boolean;
   /** Managed position id; null keeps the bootstrap-mint path. */
   positionId?: bigint | null;
 }
@@ -115,10 +117,12 @@ function harness(overrides: HarnessOptions = {}) {
     30,
     900,
     120,
+    5,
+    50,
     pool,
     {
       name: "t",
-      shouldRebalance: () => true,
+      shouldRebalance: () => overrides.shouldRebalance ?? true,
       computeRange: () => ({ lowerTick: -198670, upperTick: -197680 }),
     },
     lending,
@@ -270,6 +274,8 @@ describe("persisted re-centre cooldown", () => {
       30,
       900,
       120,
+      5,
+      50,
       pool,
       { name: "t", shouldRebalance: () => true, computeRange: () => ({ lowerTick: 0, upperTick: 1 }) },
       lendingNoop(),
@@ -300,5 +306,61 @@ describe("persisted re-centre cooldown", () => {
     await mockPoolReads(null);
     await monitor.cycle();
     expect(order.indexOf("hedge.checkHealth")).toBeLessThan(order.indexOf("hedge.open"));
+  });
+
+  /**
+   * Observed live: 0.14 WETH sat in Aave while the LP held everything else,
+   * because releaseAll lives behind the re-centre decision and the position
+   * was nowhere near its trigger.
+   */
+  it("re-centres to absorb idle capital while holding at the centre", async () => {
+    const { monitor, order } = harness({
+      movePct: 0.5,
+      positionId: 42n,
+      shouldRebalance: false, // holding on distance: only idle capital can fire
+      lastRecenterAtSecondsAgo: 10_000_000, // cooldown elapsed
+    });
+    // The mocked position is worth ~$2.44M, so this is comfortably over 5%.
+    (monitor as unknown as Record<string, unknown>).idleValueUsd = async () => 500_000;
+    await mockPoolReads(42n);
+    await monitor.cycle();
+    expect(order).toContain("rebalance");
+    expect(order.indexOf("releaseAll")).toBeLessThan(order.indexOf("rebalance"));
+  });
+
+  it("leaves dust alone rather than churning the position", async () => {
+    const { monitor, order } = harness({
+      movePct: 0.5,
+      positionId: 42n,
+      shouldRebalance: false,
+      lastRecenterAtSecondsAgo: 10_000_000,
+    });
+    (monitor as unknown as Record<string, unknown>).idleValueUsd = async () => 1;
+    await mockPoolReads(42n);
+    await monitor.cycle();
+    expect(order).not.toContain("rebalance");
+  });
+
+  /**
+   * Behind the cooldown a re-centre cannot follow, so the balance read would
+   * spend RPC calls on a decision that cannot be acted on.
+   */
+  it("does not even value idle capital while the cooldown blocks a re-centre", async () => {
+    const { monitor, order } = harness({
+      movePct: 0.5,
+      positionId: 42n,
+      shouldRebalance: false,
+      recenterMinHours: 24,
+      lastRecenterAtSecondsAgo: 60, // firmly inside the cooldown
+    });
+    let valued = false;
+    (monitor as unknown as Record<string, unknown>).idleValueUsd = async () => {
+      valued = true;
+      return 500_000;
+    };
+    await mockPoolReads(42n);
+    await monitor.cycle();
+    expect(valued).toBe(false);
+    expect(order).not.toContain("rebalance");
   });
 });

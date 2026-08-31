@@ -198,6 +198,14 @@ export interface AppConfig {
   maxPollIntervalSeconds: number;
   /** Ceiling while a short is open, so the health factor stays watched. */
   hedgePollIntervalSeconds: number;
+  /**
+   * Re-centre when undeployed capital reaches this percent of the deployed
+   * position, so a deposit is absorbed instead of waiting for price to travel
+   * far enough to trigger one on its own. 0 disables the check.
+   */
+  idleRedeployPct: number;
+  /** Absolute floor for that check, USD; stops leftover dust churning. */
+  idleRedeployMinUsd: number;
   /** Estimated gas per executed trade in USD (environment cost). */
   estimatedGasUsd: number;
   /**
@@ -348,6 +356,8 @@ export function loadConfig(mode: Mode): AppConfig {
     pollIntervalSeconds: num("POLL_INTERVAL_SECONDS", 30),
     maxPollIntervalSeconds: num("MAX_POLL_INTERVAL_SECONDS", 900),
     hedgePollIntervalSeconds: num("HEDGE_POLL_INTERVAL_SECONDS", 120),
+    idleRedeployPct: num("IDLE_REDEPLOY_PCT", 5),
+    idleRedeployMinUsd: num("IDLE_REDEPLOY_MIN_USD", 50),
     estimatedGasUsd: num("ESTIMATED_GAS_USD", 0.02),
     gas: {
       txOverheadUsd: num("GAS_TX_OVERHEAD_USD", 0),

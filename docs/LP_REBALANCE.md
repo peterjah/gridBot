@@ -473,6 +473,35 @@ real funds. Keep `HEDGE_ENABLED=false` until that exists — and note that the
 walk-forward above says the regime filter alone outperforms filter-plus-hedge
 on the configuration the backtest can score.
 
+## Absorbing deposits
+
+The bot moves capital only at transitions — park, re-enter, re-centre. Anything
+deposited while a position sits quietly at its centre waits for the next one,
+and with a 723-tick trigger plus a 24h cooldown that can be weeks. Observed
+live: 0.14 WETH sat supplied to Aave while the LP position held everything else
+and the log read `HOLD` at 53 ticks from centre.
+
+`IDLE_REDEPLOY_PCT` (default 5) makes enough undeployed capital its own reason
+to re-centre. A re-centre already withdraws everything and redeploys, so this
+adds a trigger rather than new machinery.
+
+Two gates, both of which must pass:
+
+* **The percentage** stops a trivial top-up churning a large position.
+* **`IDLE_REDEPLOY_MIN_USD`** (default 50) stops leftover dust churning a small
+  one. Minting never consumes the wallet exactly, so against a small position a
+  few cents of remainder can exceed any percentage — a floor is required or the
+  bot re-centres in a loop on its own change.
+
+The check counts the wallet **and** anything supplied to Aave: `parkIdle` may
+have banked a deposit while the bot stood aside, and `releaseAll` only withdraws
+at the moment it deploys.
+
+It is evaluated only when a re-centre could actually follow — behind the
+cooldown the balance read would spend RPC calls on a decision that cannot be
+acted on. A failed read is logged and treated as "no idle capital", so an
+accounting problem can never stop the bot from holding.
+
 ## Adaptive polling
 
 The bot's decisions are bounded by slow-moving thresholds: a re-centre needs

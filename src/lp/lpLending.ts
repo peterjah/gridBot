@@ -111,6 +111,21 @@ export class LpLendingManager {
     return true;
   }
 
+  /**
+   * Everything not deployed as liquidity: wallet balances plus anything
+   * supplied to Aave, valued in USD.
+   *
+   * Both matter for the redeploy check — `parkIdle` may have banked a deposit
+   * while the bot stood aside, and `releaseAll` only withdraws at the moment
+   * it deploys.
+   */
+  async idleValueUsd(ethPrice: number): Promise<number> {
+    const b = await this.aave.allBalances();
+    return (
+      b.usdcWallet + b.usdcLent + (b.ethWallet + b.ethLent) * ethPrice
+    );
+  }
+
   /** Current lent balances, for reporting. */
   async lentValueUsd(ethPrice: number): Promise<number> {
     const balances = await this.aave.allBalances();

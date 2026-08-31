@@ -211,6 +211,8 @@ export async function runLpLiveMode(cfg: AppConfig): Promise<void> {
     cfg.pollIntervalSeconds,
     cfg.maxPollIntervalSeconds,
     cfg.hedgePollIntervalSeconds,
+    cfg.idleRedeployPct,
+    cfg.idleRedeployMinUsd,
     pool,
     strategy,
     lending,
