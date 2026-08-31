@@ -140,6 +140,54 @@ export function getLiquidityForAmounts(
   return getLiquidityForAmount1(sqrtA, sqrtB, amount1);
 }
 
+/** Value of a token0/token1 pair expressed in token1, in raw units. */
+export function valueInToken1(sqrtPriceX96: bigint, amount0: bigint, amount1: bigint): bigint {
+  // amount0 * price, where price = (sqrtP / 2^96)^2, applied in two steps so
+  // the intermediate cannot overflow the way squaring sqrtP would.
+  return mulDiv(mulDiv(amount0, sqrtPriceX96, Q96), sqrtPriceX96, Q96) + amount1;
+}
+
+/**
+ * Liquidity that deploys the FULL value of a holding into a range.
+ *
+ * `getLiquidityForAmounts` answers a different question: the most liquidity
+ * mintable from the balances as they stand, which is the MINIMUM of what each
+ * side supports. That is right at mint time, after balances have been swapped
+ * to the target ratio, but wrong when planning — a one-sided wallet drives the
+ * result to ~0, the required amounts collapse with it, and the balancing swap
+ * then sees no imbalance to correct. Observed live: 0.1414 WETH and 0.000001
+ * USDC planned a position of 4.1e-10 WETH with `swapNeeded: false`.
+ *
+ * This instead prices the whole holding and asks what liquidity that value
+ * funds at the current price, so the caller can swap toward the ratio it
+ * implies.
+ */
+export function getLiquidityForValue(
+  sqrtP: bigint,
+  sqrtA: bigint,
+  sqrtB: bigint,
+  amount0: bigint,
+  amount1: bigint,
+): bigint {
+  if (sqrtA > sqrtB) throw new Error("sqrtA must be <= sqrtB");
+  const haveValue = valueInToken1(sqrtP, amount0, amount1);
+  if (haveValue <= 0n) return 0n;
+
+  // Scale from a reference liquidity rather than deriving a closed form: the
+  // amounts-for-liquidity maths is already exact and shared with minting.
+  const reference = Q96;
+  const { amount0: refAmount0, amount1: refAmount1 } = getAmountsForLiquidity(
+    sqrtP,
+    sqrtA,
+    sqrtB,
+    reference,
+  );
+  const refValue = valueInToken1(sqrtP, refAmount0, refAmount1);
+  if (refValue <= 0n) return 0n;
+
+  return mulDiv(reference, haveValue, refValue);
+}
+
 /** Floor(a * b / c) for bigints. */
 export function mulDiv(a: bigint, b: bigint, c: bigint): bigint {
   if (c === 0n) throw new Error("Division by zero");

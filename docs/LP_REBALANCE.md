@@ -473,6 +473,36 @@ real funds. Keep `HEDGE_ENABLED=false` until that exists — and note that the
 walk-forward above says the regime filter alone outperforms filter-plus-hedge
 on the configuration the backtest can score.
 
+## Sizing a position from value, not from balances
+
+Uniswap's `getLiquidityForAmounts` returns the most liquidity mintable from the
+balances **as they stand**, which is the minimum of what each side supports.
+That is the right question at mint time, once balances have been swapped to the
+target ratio. It is the wrong question when planning.
+
+With a one-sided wallet the minimum collapses to nearly zero, the required
+amounts collapse with it, and `planBalancingSwap` — which compares required
+against held — then sees no imbalance to correct. Nothing gets swapped, so the
+wallet stays one-sided. Circular.
+
+Measured on the live wallet (0.1414 WETH, 0.000001 USDC, ±5% band):
+
+| | liquidity | required | swap | deployed |
+| --- | --- | --- | --- | --- |
+| min-of-sides | 851,479 | 0.00000000042 WETH | none | **$0.00** |
+| by value | 144,681,676,673,633 | 0.0721 WETH + 169.92 USDC | 0.0693 WETH → USDC | **$346.84** |
+
+The planning step now uses `getLiquidityForValue`, which prices the whole
+holding and asks what liquidity that value funds at the current price, so the
+balancing swap has a real target to move toward. Minting still uses
+min-of-sides, which is correct there — after the swap it is the safe amount to
+actually commit.
+
+This bug was silent rather than loud: the mint reverts only when the wallet is
+almost entirely one-sided. Milder imbalances simply under-deployed, leaving the
+remainder idle. The position holding $49.95 while $346.85 sat in Aave was this,
+not only the missing redeploy trigger.
+
 ## Absorbing deposits
 
 The bot moves capital only at transitions — park, re-enter, re-centre. Anything

@@ -28,6 +28,7 @@ import {
   applySlippageBps,
   getAmountsForLiquidity,
   getLiquidityForAmounts,
+  getLiquidityForValue,
   getSqrtRatioAtTick,
 } from "../utils/math.js";
 import { logger } from "../utils/logger.js";
@@ -114,8 +115,12 @@ export class RebalanceExecutor {
     const sqrtLower = getSqrtRatioAtTick(range.lowerTick);
     const sqrtUpper = getSqrtRatioAtTick(range.upperTick);
 
-    // Amounts needed to deploy the wallet into the new range.
-    const liquidity = getLiquidityForAmounts(
+    // Size from the wallet's VALUE, not from the amounts as they stand.
+    // getLiquidityForAmounts takes the minimum of what each side supports, so
+    // a one-sided wallet drives it to ~0, the required amounts collapse with
+    // it, and planBalancingSwap then sees nothing to correct. That deadlock is
+    // real: 0.1414 WETH with 0.000001 USDC planned 4.1e-10 WETH of position.
+    const liquidity = getLiquidityForValue(
       sqrtPriceX96,
       sqrtLower,
       sqrtUpper,
