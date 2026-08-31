@@ -503,6 +503,30 @@ almost entirely one-sided. Milder imbalances simply under-deployed, leaving the
 remainder idle. The position holding $49.95 while $346.85 sat in Aave was this,
 not only the missing redeploy trigger.
 
+## Planning after the close, not before it
+
+The rebalance plan used to be computed once, from the wallet as it stood
+*before* the position was closed — so it excluded everything the position was
+about to release. The swap was sized for the wallet alone, and whatever the
+position gave back only reached the mint, where min-of-sides quietly discarded
+the surplus.
+
+Live consequence: a $397 book deployed $52 and left $345 idle, because the
+wallet held only WETH (just withdrawn from Aave) while the position held the
+USDC side.
+
+The plan is now recomputed after closing, against balances that include the
+released tokens. The pre-close plan is kept for the log and the dry run, and
+both go through the same `planFor` so they cannot drift apart.
+
+The post-close read also waits until the balances reflect the confirmed
+collect. The transport fails over across endpoints, so the node answering that
+read is not necessarily the one that confirmed the transfer — reading early
+returns the pre-close balances and everything downstream is sized against
+capital that is in the wallet but invisible. After the timeout it proceeds with
+what it can see rather than throwing: an under-read costs a smaller position,
+refusing to proceed leaves the capital undeployed entirely.
+
 ## Absorbing deposits
 
 The bot moves capital only at transitions — park, re-enter, re-centre. Anything

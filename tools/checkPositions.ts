@@ -15,7 +15,8 @@ import { formatUnits, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createClient } from "../src/blockchain/client.js";
 import { positionManagerAbi, erc20Abi } from "../src/uniswap/abis.js";
-import { getPoolInfo } from "../src/uniswap/pool.js";
+import { getPoolInfo, getPoolState } from "../src/uniswap/pool.js";
+import { getAmountsForLiquidity, getSqrtRatioAtTick } from "../src/utils/math.js";
 import { loadState } from "../src/bot/state.js";
 import { loadConfig } from "../src/config.js";
 
@@ -50,12 +51,20 @@ async function main(): Promise<void> {
   // Token addresses and decimals come from the pool, so this works on any
   // pool and chain rather than only WETH/USDC on Base.
   const pool = await getPoolInfo(client, poolAddress);
+  const state = await getPoolState(client, poolAddress);
 
   // --wallet, then WALLET_ADDRESS, then the address PRIVATE_KEY derives to.
   const walletAddress =
     flags["wallet"] ?? cfg.walletAddress ?? walletFromKey(cfg.privateKey);
 
-  const ids = tokenIds.length > 0 ? tokenIds : idsFromState(cfg.lpRebalance.stateFile);
+  // With no explicit ids, enumerate what the wallet actually owns. The state
+  // file only ever names the newest position, so after a confusing sequence it
+  // is the wrong place to look for where funds ended up.
+  let ids = tokenIds;
+  if (ids.length === 0 && walletAddress) {
+    ids = await ownedTokenIds(client, cfg.contracts.positionManager, walletAddress as Address);
+  }
+  if (ids.length === 0) ids = idsFromState(cfg.lpRebalance.stateFile);
   const manager = cfg.contracts.positionManager;
 
   if (ids.length === 0) {
@@ -85,6 +94,18 @@ async function main(): Promise<void> {
       console.log(`  tokensOwed0  ${owed0} ${pool.token0.symbol}`);
       console.log(`  tokensOwed1  ${owed1} ${pool.token1.symbol}`);
       console.log(`  ticks        ${p[5]} .. ${p[6]}`);
+      if (p[7] > 0n) {
+        const { amount0, amount1 } = getAmountsForLiquidity(
+          state.sqrtPriceX96,
+          getSqrtRatioAtTick(Number(p[5])),
+          getSqrtRatioAtTick(Number(p[6])),
+          p[7],
+        );
+        console.log(
+          `  holds        ${formatUnits(amount0, pool.token0.decimals)} ${pool.token0.symbol}` +
+            ` + ${formatUnits(amount1, pool.token1.decimals)} ${pool.token1.symbol}`,
+        );
+      }
       if (p[7] === 0n && (p[10] > 0n || p[11] > 0n)) {
         console.log("  NOTE: withdrawn but not collected — funds are still in the position.");
       }
@@ -119,6 +140,56 @@ function walletFromKey(privateKey: `0x${string}` | null): Address | null {
   if (!privateKey) return null;
   return privateKeyToAccount(privateKey).address;
 }
+
+/** Every position NFT held by `owner`, via ERC721Enumerable. */
+async function ownedTokenIds(
+  client: ReturnType<typeof createClient>,
+  manager: Address,
+  owner: Address,
+): Promise<bigint[]> {
+  try {
+    const count = await client.readContract({
+      address: manager,
+      abi: enumerableAbi,
+      functionName: "balanceOf",
+      args: [owner],
+    });
+    const ids: bigint[] = [];
+    for (let i = 0n; i < count; i++) {
+      ids.push(
+        await client.readContract({
+          address: manager,
+          abi: enumerableAbi,
+          functionName: "tokenOfOwnerByIndex",
+          args: [owner, i],
+        }),
+      );
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
+const enumerableAbi = [
+  {
+    name: "balanceOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "owner", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    name: "tokenOfOwnerByIndex",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "index", type: "uint256" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+] as const;
 
 /** The position the bot is currently managing, if the state file names one. */
 function idsFromState(stateFile: string): bigint[] {

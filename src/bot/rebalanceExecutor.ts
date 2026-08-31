@@ -115,29 +115,24 @@ export class RebalanceExecutor {
     const sqrtLower = getSqrtRatioAtTick(range.lowerTick);
     const sqrtUpper = getSqrtRatioAtTick(range.upperTick);
 
-    // Size from the wallet's VALUE, not from the amounts as they stand.
-    // getLiquidityForAmounts takes the minimum of what each side supports, so
-    // a one-sided wallet drives it to ~0, the required amounts collapse with
-    // it, and planBalancingSwap then sees nothing to correct. That deadlock is
-    // real: 0.1414 WETH with 0.000001 USDC planned 4.1e-10 WETH of position.
-    const liquidity = getLiquidityForValue(
-      sqrtPriceX96,
-      sqrtLower,
-      sqrtUpper,
+    // Sized from the wallet's VALUE, not from the amounts as they stand:
+    // min-of-sides collapses to ~0 on a one-sided wallet, the required amounts
+    // collapse with it, and planBalancingSwap then sees nothing to correct.
+    //
+    // This is the pre-close view, so it excludes whatever the position still
+    // holds. It drives the log and the dry run; the live plan is recomputed
+    // after closing, against balances that include it.
+    const { liquidity, required0, required1, swapPlan } = this.planFor(
       balance0Before,
       balance1Before,
-    );
-    if (liquidity === 0n) {
-      throw new Error("Computed zero liquidity for new position (balances too small?)");
-    }
-    const { amount0: required0, amount1: required1 } = getAmountsForLiquidity(
       sqrtPriceX96,
       sqrtLower,
       sqrtUpper,
-      liquidity,
     );
-
-    const swapPlan = planBalancingSwap(required0, required1, balance0Before, balance1Before);
+    const closingValue = position?.liquidity ?? 0n;
+    if (liquidity === 0n && closingValue === 0n) {
+      throw new Error("Computed zero liquidity for new position (balances too small?)");
+    }
 
     logger.info("Rebalance plan", {
       oldPositionId: position?.tokenId.toString() ?? "none (bootstrap mint)",
@@ -174,6 +169,7 @@ export class RebalanceExecutor {
     }
 
     // ---- Execution phase (chain state is the source of truth) --------------
+    let collectedTotals: TokenAmounts = { amount0: 0n, amount1: 0n };
     if (position) {
       const withdrawn =
         position.liquidity > 0n
@@ -182,21 +178,51 @@ export class RebalanceExecutor {
       // Always collect, even at zero liquidity: a previous cycle may have
       // withdrawn and then failed, leaving everything as tokensOwed.
       const collected = await this.collect(position);
+      collectedTotals = collected;
       this.reportFees(withdrawn, collected, sqrtPriceX96);
     }
 
-    let [balance0, balance1] = await this.getBalances();
+    // Wait for the collect to be visible before reading. The transport fails
+    // over across endpoints, so the node answering this read is not
+    // necessarily the one that confirmed the collect. Reading early returns
+    // the PRE-close balances, and everything downstream is then sized against
+    // capital that is already in the wallet but invisible.
+    let [balance0, balance1] = await this.awaitBalancesAtLeast(
+      balance0Before + collectedTotals.amount0,
+      balance1Before + collectedTotals.amount1,
+    );
     logger.info("Balances available to deploy", {
       token0: formatUnits(balance0, this.pool.token0.decimals),
       token1: formatUnits(balance1, this.pool.token1.decimals),
     });
 
+    // Re-plan against what is ACTUALLY in the wallet.
+    //
+    // The plan above was computed before the position was closed, so it did
+    // not include anything the position released — sizing the swap for the
+    // wallet alone and leaving the rest to fall out of the min-of-sides at
+    // mint time. Observed live: a $397 book deployed $52 and left $345 idle.
+    const livePlan = this.planFor(balance0, balance1, sqrtPriceX96, sqrtLower, sqrtUpper);
+    if (livePlan.liquidity === 0n) {
+      throw new Error("Computed zero liquidity after closing (balances too small?)");
+    }
+    if (livePlan.swapPlan !== null || swapPlan !== null) {
+      logger.info("Rebalance plan (after closing)", {
+        liquidity: livePlan.liquidity.toString(),
+        required0: formatUnits(livePlan.required0, this.pool.token0.decimals),
+        required1: formatUnits(livePlan.required1, this.pool.token1.decimals),
+        balance0: formatUnits(balance0, this.pool.token0.decimals),
+        balance1: formatUnits(balance1, this.pool.token1.decimals),
+        swapNeeded: livePlan.swapPlan !== null,
+      });
+    }
+
     // The swap moves the pool price, so the value read at the start of this
     // cycle is stale by the time we mint. Minting against it computes the
     // wrong liquidity and the wrong token ratio — re-read instead.
     let mintSqrtPriceX96 = sqrtPriceX96;
-    if (swapPlan) {
-      await this.executeSwap(swapPlan);
+    if (livePlan.swapPlan) {
+      await this.executeSwap(livePlan.swapPlan);
       [balance0, balance1] = await this.getBalances();
       const after = await getPoolState(this.client, this.pool.address);
       mintSqrtPriceX96 = after.sqrtPriceX96;
@@ -355,6 +381,9 @@ export class RebalanceExecutor {
     sqrtUpper: bigint,
   ): Promise<void> {
     // Recompute from live balances so a partial failure recovers safely.
+    // min-of-sides here, deliberately: after the balancing swap this is the
+    // most that can actually be committed from the balances in hand, and
+    // asking for more than the wallet holds reverts.
     const liquidity = getLiquidityForAmounts(sqrtPriceX96, sqrtLower, sqrtUpper, balance0, balance1);
     if (liquidity === 0n) {
       throw new Error("Computed zero liquidity when minting (balances too small?)");
@@ -558,6 +587,75 @@ export class RebalanceExecutor {
 
   private tokenForDirection(zeroForOne: boolean): Address {
     return zeroForOne ? this.pool.token0.address : this.pool.token1.address;
+  }
+
+  /**
+   * Size a position from the given balances and work out the swap to reach it.
+   *
+   * Shared by the pre-close plan (for the log and dry run) and the live one
+   * computed after closing, so the two cannot drift apart.
+   */
+  private planFor(
+    balance0: bigint,
+    balance1: bigint,
+    sqrtPriceX96: bigint,
+    sqrtLower: bigint,
+    sqrtUpper: bigint,
+  ): {
+    liquidity: bigint;
+    required0: bigint;
+    required1: bigint;
+    swapPlan: ReturnType<typeof planBalancingSwap>;
+  } {
+    const liquidity = getLiquidityForValue(
+      sqrtPriceX96,
+      sqrtLower,
+      sqrtUpper,
+      balance0,
+      balance1,
+    );
+    const { amount0: required0, amount1: required1 } = getAmountsForLiquidity(
+      sqrtPriceX96,
+      sqrtLower,
+      sqrtUpper,
+      liquidity,
+    );
+    return {
+      liquidity,
+      required0,
+      required1,
+      swapPlan: planBalancingSwap(required0, required1, balance0, balance1),
+    };
+  }
+
+  /**
+   * Read balances, waiting until they reflect a transfer already confirmed.
+   *
+   * Falls through to whatever is there after the timeout rather than throwing:
+   * an under-read costs a smaller position, while refusing to proceed leaves
+   * the capital undeployed entirely.
+   */
+  private async awaitBalancesAtLeast(
+    expected0: bigint,
+    expected1: bigint,
+    attempts = 10,
+  ): Promise<[bigint, bigint]> {
+    let latest: [bigint, bigint] = await this.getBalances();
+    for (let i = 0; i < attempts; i++) {
+      if (latest[0] >= expected0 && latest[1] >= expected1) {
+        if (i > 0) logger.debug("Balances visible after retry", { attempt: i + 1 });
+        return latest;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      latest = await this.getBalances();
+    }
+    logger.warn("Balances still below the confirmed total; proceeding with what is visible", {
+      expected0: formatUnits(expected0, this.pool.token0.decimals),
+      expected1: formatUnits(expected1, this.pool.token1.decimals),
+      actual0: formatUnits(latest[0], this.pool.token0.decimals),
+      actual1: formatUnits(latest[1], this.pool.token1.decimals),
+    });
+    return latest;
   }
 
   private async getBalances(): Promise<[bigint, bigint]> {
