@@ -519,13 +519,24 @@ The plan is now recomputed after closing, against balances that include the
 released tokens. The pre-close plan is kept for the log and the dry run, and
 both go through the same `planFor` so they cannot drift apart.
 
-The post-close read also waits until the balances reflect the confirmed
-collect. The transport fails over across endpoints, so the node answering that
+Every balance read that follows a transaction now waits for that transaction to
+be visible — after the collect, after the balancing swap, and before the park
+supplies to Aave. The transport fails over across endpoints, so the node answering that
 read is not necessarily the one that confirmed the transfer — reading early
 returns the pre-close balances and everything downstream is sized against
 capital that is in the wallet but invisible. After the timeout it proceeds with
 what it can see rather than throwing: an under-read costs a smaller position,
 refusing to proceed leaves the capital undeployed entirely.
+
+This class of bug is easy to underestimate. A confirmed receipt does not mean
+the next read sees the result: the swap and the mint can land in the SAME
+block, and the transport fails over across endpoints. Every occurrence so far
+has been silent — the wrong number, not an error:
+
+* a swap of 0.0702 WETH → 172.26 USDC confirmed, the read still showed the
+  pre-swap 26.21 USDC, and the mint deployed $52 of a $397 book;
+* the park supplied 0.0703 WETH, then found another 0.0167 fifteen minutes
+  later, leaving USDC below the supply threshold stranded in the wallet.
 
 ## Absorbing deposits
 

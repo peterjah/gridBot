@@ -222,14 +222,31 @@ export class RebalanceExecutor {
     // wrong liquidity and the wrong token ratio — re-read instead.
     let mintSqrtPriceX96 = sqrtPriceX96;
     if (livePlan.swapPlan) {
-      await this.executeSwap(livePlan.swapPlan);
-      [balance0, balance1] = await this.getBalances();
+      const { minOut } = await this.executeSwap(livePlan.swapPlan);
+
+      // Wait for the swap OUTPUT to be visible before reading. A confirmed
+      // receipt does not mean the next read sees it: the swap and the mint can
+      // land in the same block, and the transport fails over across endpoints.
+      // Reading early returns the PRE-swap balance, and min-of-sides at mint
+      // then deploys only the token the swap was meant to top up.
+      //
+      // Observed live: a swap of 0.0702 WETH -> 172.26 USDC confirmed, the
+      // read still showed 26.21 USDC, and the mint deployed $52 of a $397
+      // book. The stale read left ~$172 sitting in the wallet.
+      const [pre0, pre1] = [balance0, balance1];
+      [balance0, balance1] = await this.awaitBalancesAtLeast(
+        livePlan.swapPlan.zeroForOne ? 0n : pre0 + minOut,
+        livePlan.swapPlan.zeroForOne ? pre1 + minOut : 0n,
+      );
+
       const after = await getPoolState(this.client, this.pool.address);
       mintSqrtPriceX96 = after.sqrtPriceX96;
       logger.info("Pool price after rebalancing swap", {
         before: sqrtPriceX96.toString(),
         after: mintSqrtPriceX96.toString(),
         tick: after.currentTick,
+        balance0: formatUnits(balance0, this.pool.token0.decimals),
+        balance1: formatUnits(balance1, this.pool.token1.decimals),
       });
     }
 
@@ -272,15 +289,28 @@ export class RebalanceExecutor {
       return;
     }
 
+    const [before0, before1] = await this.getBalances();
     const withdrawn =
       position.liquidity > 0n
         ? await this.decreaseLiquidity(position)
         : { amount0: 0n, amount1: 0n };
     const collected = await this.collect(position);
     this.reportFees(withdrawn, collected, sqrtPriceX96);
+
+    // Do not return until the collected tokens are readable. Callers act on
+    // the wallet immediately afterwards — `parkIdle` supplies it to Aave — and
+    // a stale read makes them act on a fraction of it. Observed live: the park
+    // supplied 0.0703 WETH, then found another 0.0167 fifteen minutes later,
+    // and left USDC below the supply threshold stranded in the wallet.
+    const [after0, after1] = await this.awaitBalancesAtLeast(
+      before0 + collected.amount0,
+      before1 + collected.amount1,
+    );
     logger.info("Standing aside — position closed to cash", {
       tokenId: position.tokenId.toString(),
       recoveredOwedOnly: position.liquidity === 0n,
+      token0: formatUnits(after0, this.pool.token0.decimals),
+      token1: formatUnits(after1, this.pool.token1.decimals),
     });
   }
 
@@ -336,7 +366,10 @@ export class RebalanceExecutor {
     return (await this.readEventAmounts(hash, "Collect")) ?? { amount0: 0n, amount1: 0n };
   }
 
-  private async executeSwap(plan: { zeroForOne: boolean; amountIn: bigint }): Promise<void> {
+  private async executeSwap(plan: {
+    zeroForOne: boolean;
+    amountIn: bigint;
+  }): Promise<{ minOut: bigint }> {
     const tokenIn = this.tokenForDirection(plan.zeroForOne);
     const tokenOut = this.tokenForDirection(!plan.zeroForOne);
 
@@ -369,6 +402,7 @@ export class RebalanceExecutor {
       amountOutMinimum,
     });
     await this.send("exactInputSingle", this.config.swapRouterAddress, data);
+    return { minOut: amountOutMinimum };
   }
 
   private async mint(

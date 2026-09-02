@@ -52,7 +52,7 @@ function position(over: Partial<PositionInfo>): PositionInfo {
 function executor(): { exec: RebalanceExecutor; calls: string[] } {
   const calls: string[] = [];
   const exec = new RebalanceExecutor(
-    {} as never,
+    { readContract: async () => 0n } as never,
     { account: { address: baseCfg.positionManagerAddress } } as never,
     baseCfg,
     null,

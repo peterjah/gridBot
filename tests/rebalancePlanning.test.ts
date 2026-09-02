@@ -45,7 +45,7 @@ function harness(opts: { walletBefore: [bigint, bigint]; afterClose: [bigint, bi
   let closed = false;
 
   const exec = new RebalanceExecutor(
-    {} as never,
+    { readContract: async () => 0n } as never,
     { account: { address: pool.address } } as never,
     cfg,
     "0x8E272640D66FfBC657FB8c856278A4ff17B3e937",
@@ -71,6 +71,8 @@ function harness(opts: { walletBefore: [bigint, bigint]; afterClose: [bigint, bi
   self.reportFees = () => {};
   self.executeSwap = async (plan: { zeroForOne: boolean; amountIn: bigint }) => {
     calls.push(`swap:${plan.zeroForOne ? "WETH->USDC" : "USDC->WETH"}:${plan.amountIn}`);
+    // The executor waits for this much output to become readable.
+    return { minOut: 0n };
   };
   self.mint = async (_l: number, _u: number, b0: bigint, b1: bigint) => {
     calls.push(`mint:${b0}:${b1}`);
@@ -131,5 +133,63 @@ describe("rebalance planning", () => {
     await exec.rebalance(null, sqrtPriceX96, -198270);
     expect(calls.some((c) => c.startsWith("swap:"))).toBe(false);
     expect(calls.some((c) => c.startsWith("mint:"))).toBe(true);
+  });
+
+  /**
+   * The production failure. A swap of 0.0702 WETH -> 172.26 USDC confirmed in
+   * the same block as the mint; the balance read still showed the pre-swap
+   * 26.21 USDC, so min-of-sides deployed $52 of a $397 book and left ~$172 in
+   * the wallet. The executor must wait for the swap output to be readable.
+   */
+  it("waits for the swap output before minting", async () => {
+    const calls: string[] = [];
+    let closed = false;
+    let swapped = false;
+
+    const exec = new RebalanceExecutor(
+      { readContract: async () => 0n } as never,
+      { account: { address: pool.address } } as never,
+      cfg,
+      "0x8E272640D66FfBC657FB8c856278A4ff17B3e937",
+      pool,
+      {
+        name: "t",
+        shouldRebalance: () => true,
+        computeRange: () => ({ lowerTick: -198750, upperTick: -197770 }),
+      },
+    );
+    const self = exec as unknown as Record<string, unknown>;
+
+    // The node lags by one read after the swap, exactly as it did live.
+    let readsSinceSwap = 0;
+    self.getBalances = async () => {
+      if (!closed) return [141_396_878_202_825_451n, 1n];
+      if (!swapped) return [151_197_784_493_936_270n, 26_210_425n];
+      readsSinceSwap++;
+      return readsSinceSwap === 1
+        ? [151_197_784_493_936_270n, 26_210_425n] // stale: pre-swap
+        : [81_000_207_087_101_295n, 198_474_476n]; // post-swap
+    };
+    self.decreaseLiquidity = async () => ({ amount0: 0n, amount1: 0n });
+    self.collect = async () => {
+      closed = true;
+      return { amount0: 0n, amount1: 0n };
+    };
+    self.reportFees = () => {};
+    self.executeSwap = async () => {
+      swapped = true;
+      return { minOut: 171_402_730n };
+    };
+    self.mint = async (_l: number, _u: number, b0: bigint, b1: bigint) => {
+      calls.push(`mint:${b0}:${b1}`);
+    };
+
+    const poolMod = await import("../src/uniswap/pool.js");
+    vi.spyOn(poolMod, "getPoolState").mockResolvedValue({ sqrtPriceX96, currentTick: -198270 } as never);
+
+    await exec.rebalance(position(), sqrtPriceX96, -198270);
+
+    // It must mint from the POST-swap balances, not the stale 26.21 USDC.
+    expect(calls[0]).toBe("mint:81000207087101295:198474476");
   });
 });
