@@ -26,6 +26,7 @@ const options: LpWalkForwardOptions = {
     recenterMinHours: [24],
     regimeMaxMovePcts: [0],
     hedgeRatioPcts: [0],
+    regimeMetrics: ["displacement"],
   },
   metric: "RETURN",
   input: {
@@ -40,6 +41,7 @@ const options: LpWalkForwardOptions = {
       hedgeRatioPct: 0,
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
+      regimeMetric: "displacement" as const,
     },
     gas: 0.02,
   },

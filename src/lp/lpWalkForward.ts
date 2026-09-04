@@ -4,6 +4,7 @@ import { trainTestSplit } from "../backtest/periods.js";
 import { annualize } from "../backtest/walkForward.js";
 import { evaluateLp, rankLp, sweepLp } from "./lpOptimizer.js";
 import type { LpAxes, LpEvalInput, LpMetrics } from "./lpOptimizer.js";
+import type { RegimeMetric } from "./passiveLp.js";
 
 /**
  * Out-of-sample validation for passive LP.
@@ -46,6 +47,8 @@ export interface LpParams {
   regimeMaxMovePct: number;
   /** Percent of ETH exposure held short; 0 = unhedged. */
   hedgeRatioPct: number;
+  /** How the regime is measured. */
+  regimeMetric: RegimeMetric;
 }
 
 export interface LpWalkForwardOptions {
@@ -117,6 +120,7 @@ function runLpFold(
     { ...options.input, prices: test },
     best.regimeMaxMovePct,
     best.hedgeRatioPct,
+    best.regimeMetric,
   );
 
   const span = (points: PricePoint[]) =>
@@ -138,6 +142,7 @@ function runLpFold(
       recenterMinHours: best.recenterMinHours,
       regimeMaxMovePct: best.regimeMaxMovePct,
       hedgeRatioPct: best.hedgeRatioPct,
+      regimeMetric: best.regimeMetric,
     },
     train: best,
     test: test_,
@@ -153,7 +158,9 @@ export function describeLpParams(p: LpParams): string {
     p.regimeMaxMovePct > 0
       ? `${base}, stand aside above ${p.regimeMaxMovePct}% trailing move`
       : `${base}, regime filter off`;
-  return p.hedgeRatioPct > 0 ? `${regime}, ${p.hedgeRatioPct}% short hedge` : regime;
+  const withMetric =
+    p.regimeMaxMovePct > 0 ? `${regime} [${p.regimeMetric}]` : regime;
+  return p.hedgeRatioPct > 0 ? `${withMetric}, ${p.hedgeRatioPct}% short hedge` : withMetric;
 }
 
 export function formatLpFold(fold: LpFoldResult): string {
@@ -215,7 +222,7 @@ export function formatLpWalkForwardSummary(folds: LpFoldResult[]): string {
   line("PASSIVE LP WALK-FORWARD SUMMARY");
   line(RULE);
   line();
-  line("Fold      Range   Recentre  Regime  Hedge   Train/yr   Test ret   Test/yr  Test MaxDD  Parked   Test ETH   vs ETH");
+  line("Fold      Range   Recentre  Regime  Metric         Train/yr   Test ret   Test/yr  Test MaxDD  Parked   Test ETH   vs ETH");
   line(THIN);
   for (const f of folds) {
     line(
@@ -224,7 +231,7 @@ export function formatLpWalkForwardSummary(folds: LpFoldResult[]): string {
         `±${f.best.rangePct}%`.padEnd(8),
         (f.best.recenterBufferPct === 0 ? "never" : `${f.best.recenterBufferPct}%`).padEnd(10),
         (f.best.regimeMaxMovePct > 0 ? `${f.best.regimeMaxMovePct}%` : "off").padEnd(8),
-        (f.best.hedgeRatioPct > 0 ? `${f.best.hedgeRatioPct}%` : "off").padEnd(7),
+        (f.best.regimeMaxMovePct > 0 ? f.best.regimeMetric : "—").padEnd(15),
         pct(annualize(f.train.returnPct, f.trainYears)).padStart(10),
         pct(f.test.returnPct).padStart(11),
         pct(annualize(f.test.returnPct, f.testYears)).padStart(10),
@@ -297,5 +304,5 @@ export function selectLpConsensus(folds: LpFoldResult[]): LpConsensusPick[] {
 }
 
 function lpKey(p: LpParams): string {
-  return `${p.rangePct}|${p.recenterBufferPct}|${p.recenterMinHours}|${p.regimeMaxMovePct}|${p.hedgeRatioPct}`;
+  return `${p.rangePct}|${p.recenterBufferPct}|${p.recenterMinHours}|${p.regimeMaxMovePct}|${p.hedgeRatioPct}|${p.regimeMetric}`;
 }

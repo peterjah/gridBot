@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type { GridConfig } from "./grid/types.js";
 import type { AppConfig, GridSettings } from "./config.js";
 import { pctToTicks } from "./config.js";
+import type { RegimeMetric } from "./lp/passiveLp.js";
 import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
 
 /**
@@ -41,6 +42,8 @@ import { levelsForWidth, parseRankMetric } from "./backtest/optimizer.js";
  *                        moves (0 = filter off)
  *   --lp-hedge-ratios 0,50,100  LP sweep axis: percent of the position's ETH
  *                        exposure held short (0 = unhedged)
+ *   --lp-regime-metrics displacement,signed,drawdown,volatility
+ *                        how "hostile" is measured over the lookback window
  *   --regime-lookback 336 observations in the regime lookback window
  *   --regen-min-seconds   minimum cooldown seconds before rebuilding (default 21600)
  *   --vol-lookback 24    observations used for volatility estimate
@@ -312,13 +315,18 @@ export function applyArgOverrides(cfg: AppConfig, args: Record<string, string>):
   const lpHours = argNumList("lp-recenter-hours", args["lp-recenter-hours"]);
   const lpRegimes = argNumList("lp-regime-moves", args["lp-regime-moves"]);
   const lpHedges = argNumList("lp-hedge-ratios", args["lp-hedge-ratios"]);
-  if (lpRanges || lpBuffers || lpHours || lpRegimes || lpHedges) {
+  const lpMetrics = args["lp-regime-metrics"]
+    ?.split(",")
+    .map((m) => m.trim())
+    .filter(Boolean) as RegimeMetric[] | undefined;
+  if (lpRanges || lpBuffers || lpHours || lpRegimes || lpHedges || lpMetrics) {
     cfg.lpAxes = {
       rangePcts: lpRanges ?? [5, 10, 15, 20, 30, 50, 75],
       recenterBuffers: lpBuffers ?? [0, 10, 25, 50, 100],
       recenterMinHours: lpHours ?? [24],
       regimeMaxMovePcts: lpRegimes ?? [0],
       hedgeRatioPcts: lpHedges ?? [0],
+      regimeMetrics: lpMetrics ?? ["displacement"],
     };
   }
   if (args["gas-tx-overhead"] !== undefined) cfg.gas.txOverheadUsd = Number(args["gas-tx-overhead"]);

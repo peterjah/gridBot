@@ -182,6 +182,57 @@ level — and it is the failure mode no amount of fee income fixes.
 * The unhedged directional exposure is the dominant risk, not the parameters.
   A regime filter or a short hedge addresses it; tuning range width does not.
 
+## Choosing the regime metric
+
+`trailingMovePct` is net **displacement** — where price ended versus 168h
+earlier, two points out of the whole window. It is not a volatility measure: a
+week that runs +20% and returns to flat reads 0%, while one that grinds +4%
+steadily reads hostile.
+
+That looks like an obvious thing to improve, so `REGIME_METRIC` makes the choice
+a sweepable axis and the question was settled by measurement:
+
+* `displacement` — |end/start − 1|, the shipped default
+* `signed` — park only on a FALL, since an LP is structurally long
+* `drawdown` — worst peak-to-trough inside the window
+* `volatility` — realized volatility of log returns, the conventional answer
+
+Out-of-sample folds, ±5% band, 50% buffer, best threshold for each:
+
+| metric | best mean | worst fold | parked |
+| --- | --- | --- | --- |
+| none | −7.78% | −29.7% | 0% |
+| **displacement 2–3%** | **+4.03%** | −8.7% | 60–65% |
+| drawdown 4–6% | +3.51% | **−5.3%** | 69–82% |
+| volatility 5–6% | +3.18% | **−3.2%** | 72–85% |
+| signed | +2.22% | −13.5% | 33% |
+
+**Two findings worth keeping.**
+
+*Realized volatility is not an improvement on displacement.* At a loose
+threshold it is the worst option in the table (−7.97% mean at 12%, barely
+distinguishable from no filter). It only looks respectable when tightened far
+enough to park 72–85% of the time, at which point it is closer to "mostly not
+invested" than to a filter.
+
+*Signed is worse than absolute, which contradicts the correlation study that
+suggested it.* Grouping past weeks by direction showed falls followed by −0.63%
+and rallies by +1.24%, implying the filter should ignore rallies. Simulated, it
+is worse at every comparable threshold. The correlation was over single forward
+weeks; the folds are quarters, and what the filter actually does is sit out
+sustained declines rather than pick individual weeks. **The direct simulation is
+the one that decides — it evaluates the decision actually being made.**
+
+**Threshold sensitivity matters more than the metric.** Averaged across
+thresholds, all four land between +0.9% and +2.1% mean; each has a bad cell.
+Displacement has the best single cell, drawdown and volatility the most
+forgiving tails. Reading any one row as "the answer" would be fitting a cell.
+
+The default stays `displacement` at 3%: best measured mean, and the only
+configuration with live evidence behind it. `drawdown` at 5–6% is the
+alternative worth considering if tail risk matters more than return — it halves
+the worst fold, at the cost of being parked far more.
+
 ## The regime filter — "run it sideways, stop on big moves"
 
 Since the out-of-sample losses track ETH rather than the parameters, the obvious

@@ -49,6 +49,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       regimeMaxMovePct: cfg.grid.regimeMaxMovePct,
       regimeLookbackPoints: cfg.grid.regimeLookbackPoints,
       hedgeRatioPct: 0,
+      regimeMetric: "displacement",
       hedgeBorrowAprPct: cfg.hedgeBorrowAprPct,
       // Model the continuous hedge by default: the shipped live hedge only
       // covers the parked leg, and the exposure that loses money is the LP
@@ -127,6 +128,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
             m.recenterBufferPct === selection.params.recenterBufferPct &&
             m.recenterMinHours === selection.params.recenterMinHours &&
             m.regimeMaxMovePct === selection.params.regimeMaxMovePct &&
+            m.regimeMetric === selection.params.regimeMetric &&
             m.hedgeRatioPct === selection.params.hedgeRatioPct,
         ) ?? fullPeriodBest);
 
@@ -162,6 +164,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       recenterMinHours: best.recenterMinHours,
       regimeMaxMovePct: best.regimeMaxMovePct,
       hedgeRatioPct: best.hedgeRatioPct,
+      regimeMetric: best.regimeMetric,
     },
     prices,
     cfg.gas,
@@ -225,6 +228,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       "recenter_buffer_pct",
       "recenter_min_hours",
       "regime_max_move_pct",
+      "regime_metric",
       "hedge_ratio_pct",
       "final_value",
       "return",
@@ -245,6 +249,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       m.recenterBufferPct,
       m.recenterMinHours,
       m.regimeMaxMovePct,
+      m.regimeMetric,
       m.hedgeRatioPct,
       m.finalValue,
       m.returnPct,
@@ -280,6 +285,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
         "recenter_buffer_pct",
         "recenter_min_hours",
         "regime_max_move_pct",
+        "regime_metric",
         "hedge_ratio_pct",
         "train_return",
         "train_annualized",
@@ -307,6 +313,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
         f.best.recenterBufferPct,
         f.best.recenterMinHours,
         f.best.regimeMaxMovePct,
+        f.best.regimeMetric,
         f.best.hedgeRatioPct,
         f.train.returnPct,
         annualize(f.train.returnPct, f.trainYears),

@@ -18,6 +18,8 @@ import { concentrationMultiplier, feeShareOfPool } from "./concentration.js";
  * module, in sqrt units where sqrtP = sqrt(price).
  */
 
+export type RegimeMetric = "displacement" | "signed" | "drawdown" | "volatility";
+
 export interface PassiveLpConfig {
   initialUsdc: number;
   initialEth: number;
@@ -53,6 +55,24 @@ export interface PassiveLpConfig {
   regimeMaxMovePct: number;
   /** Observations in the trailing-move window. */
   regimeLookbackPoints: number;
+  /**
+   * How "the market is hostile" is measured over the lookback window.
+   *
+   * `displacement` is net |end/start - 1|: two points out of the whole window,
+   * blind to the path between them. It is what shipped, and it is not a
+   * volatility measure.
+   *
+   * `signed` parks only on a FALL. An LP is structurally long, so a week that
+   * rose and a week that fell are not the same event, and taking the absolute
+   * value conflates them.
+   *
+   * `drawdown` is the worst peak-to-trough inside the window.
+   *
+   * `volatility` is realized volatility of log returns over the window — the
+   * conventional answer, included so the comparison is decided by measurement
+   * rather than by which one sounds most rigorous.
+   */
+  regimeMetric: RegimeMetric;
   /**
    * Percent of the position's ETH exposure held short, 0 = unhedged.
    *
@@ -281,7 +301,48 @@ export function runPassiveLp(
     if (i < lookback) return false;
     const firstPrice = data[i - lookback]!.price;
     if (!(firstPrice > 0)) return false;
-    return Math.abs((data[i]!.price / firstPrice - 1) * 100) > cfg.regimeMaxMovePct;
+    const nowPrice = data[i]!.price;
+
+    switch (cfg.regimeMetric) {
+      case "signed": {
+        // Only a FALL is hostile. A rally moves the position out of range too,
+        // but into the side that is followed by the best outcomes in-sample.
+        return (nowPrice / firstPrice - 1) * 100 < -cfg.regimeMaxMovePct;
+      }
+      case "drawdown": {
+        let peak = 0;
+        let worst = 0;
+        for (let j = i - lookback; j <= i; j++) {
+          const p = data[j]!.price;
+          if (p > peak) peak = p;
+          if (peak > 0) worst = Math.min(worst, (p - peak) / peak);
+        }
+        return Math.abs(worst) * 100 > cfg.regimeMaxMovePct;
+      }
+      case "volatility": {
+        // Standard deviation of log returns across the window, scaled to the
+        // window so the threshold is comparable to a percentage move.
+        let sum = 0;
+        let count = 0;
+        for (let j = i - lookback + 1; j <= i; j++) {
+          const prev = data[j - 1]!.price;
+          if (prev > 0) {
+            sum += Math.log(data[j]!.price / prev);
+            count++;
+          }
+        }
+        if (count < 2) return false;
+        const mean = sum / count;
+        let variance = 0;
+        for (let j = i - lookback + 1; j <= i; j++) {
+          const prev = data[j - 1]!.price;
+          if (prev > 0) variance += (Math.log(data[j]!.price / prev) - mean) ** 2;
+        }
+        return Math.sqrt(variance / count) * Math.sqrt(count) * 100 > cfg.regimeMaxMovePct;
+      }
+      default:
+        return Math.abs((nowPrice / firstPrice - 1) * 100) > cfg.regimeMaxMovePct;
+    }
   };
 
   resizeHedge(first.price);

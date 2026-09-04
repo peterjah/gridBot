@@ -2,7 +2,7 @@ import type { PricePoint } from "../data/provider.js";
 import type { GasModel } from "../backtest/gasModel.js";
 import { RULE, THIN, pct, signedUsd, usd } from "../backtest/format.js";
 import { assertLpReconciles, runPassiveLp } from "./passiveLp.js";
-import type { PassiveLpConfig, PassiveLpResult } from "./passiveLp.js";
+import type { PassiveLpConfig, PassiveLpResult, RegimeMetric } from "./passiveLp.js";
 
 /**
  * Parameter sweep for passive LP. It has far fewer knobs than the grid —
@@ -24,6 +24,8 @@ export interface LpAxes {
   regimeMaxMovePcts: number[];
   /** Short ratios to try, percent of ETH exposure. 0 = unhedged. */
   hedgeRatioPcts: number[];
+  /** How the regime is measured; see RegimeMetric. */
+  regimeMetrics: RegimeMetric[];
 }
 
 export const DEFAULT_LP_AXES: LpAxes = {
@@ -32,6 +34,7 @@ export const DEFAULT_LP_AXES: LpAxes = {
   recenterMinHours: [24],
   regimeMaxMovePcts: [0],
   hedgeRatioPcts: [0],
+  regimeMetrics: ["displacement"],
 };
 
 export interface LpMetrics {
@@ -40,6 +43,7 @@ export interface LpMetrics {
   recenterMinHours: number;
   regimeMaxMovePct: number;
   hedgeRatioPct: number;
+  regimeMetric: RegimeMetric;
   finalValue: number;
   returnPct: number;
   maxDrawdownPct: number;
@@ -75,6 +79,7 @@ export function evaluateLp(
   input: LpEvalInput,
   regimeMaxMovePct?: number,
   hedgeRatioPct?: number,
+  regimeMetric?: RegimeMetric,
 ): LpMetrics {
   const cfg: PassiveLpConfig = {
     ...input.base,
@@ -83,6 +88,7 @@ export function evaluateLp(
     recenterMinHours,
     ...(regimeMaxMovePct === undefined ? {} : { regimeMaxMovePct }),
     ...(hedgeRatioPct === undefined ? {} : { hedgeRatioPct }),
+    ...(regimeMetric === undefined ? {} : { regimeMetric }),
   };
   const result = runPassiveLp(cfg, input.prices, input.gas);
   assertLpReconciles(result);
@@ -96,6 +102,7 @@ export function metricsOf(r: PassiveLpResult): LpMetrics {
     recenterMinHours: r.config.recenterMinHours,
     regimeMaxMovePct: r.config.regimeMaxMovePct,
     hedgeRatioPct: r.config.hedgeRatioPct,
+    regimeMetric: r.config.regimeMetric,
     finalValue: r.finalValue,
     returnPct: r.returnPct,
     maxDrawdownPct: r.maxDrawdownPct,
@@ -120,6 +127,7 @@ export function sweepLp(axes: LpAxes, input: LpEvalInput): LpSweepResult {
 
   const regimes = axes.regimeMaxMovePcts?.length ? axes.regimeMaxMovePcts : [0];
   const hedges = axes.hedgeRatioPcts?.length ? axes.hedgeRatioPcts : [0];
+  const metrics_ = axes.regimeMetrics?.length ? axes.regimeMetrics : (["displacement"] as RegimeMetric[]);
   for (const rangePct of axes.rangePcts) {
     for (const buffer of axes.recenterBuffers) {
       for (const minHours of axes.recenterMinHours) {
@@ -128,10 +136,17 @@ export function sweepLp(axes: LpAxes, input: LpEvalInput): LpSweepResult {
         if (buffer === 0 && minHours !== axes.recenterMinHours[0]) continue;
         for (const regime of regimes) {
           for (const hedge of hedges) {
-            try {
-              metrics.push(evaluateLp(rangePct, buffer, minHours, input, regime, hedge));
-            } catch {
-              skipped++;
+            for (const metric of metrics_) {
+              // Without a regime threshold the metric is inert; collapse the
+              // duplicates rather than padding the table with identical rows.
+              if (regime === 0 && metric !== metrics_[0]) continue;
+              try {
+                metrics.push(
+                  evaluateLp(rangePct, buffer, minHours, input, regime, hedge, metric),
+                );
+              } catch {
+                skipped++;
+              }
             }
           }
         }
@@ -166,7 +181,7 @@ export function formatLpTable(metrics: LpMetrics[], metric: string, limit = 15):
   line(RULE);
   line();
   line(
-    "Rank  Range   Recentre  Regime  Hedge    Return    MaxDD   InRange   Parked   Fee income   Position P&L   Hedge P&L  Recentres",
+    "Rank  Range   Recentre  Regime  Metric        Return    MaxDD   InRange   Parked   Fee income   Position P&L  Recentres",
   );
   line(THIN);
   ranked.forEach((m, i) => {
@@ -176,14 +191,13 @@ export function formatLpTable(metrics: LpMetrics[], metric: string, limit = 15):
         `±${m.rangePct}%`.padEnd(8),
         (m.recenterBufferPct === 0 ? "never" : `${m.recenterBufferPct}%`).padEnd(10),
         (m.regimeMaxMovePct > 0 ? `${m.regimeMaxMovePct}%` : "off").padEnd(8),
-        (m.hedgeRatioPct > 0 ? `${m.hedgeRatioPct}%` : "off").padEnd(7),
+        (m.regimeMaxMovePct > 0 ? m.regimeMetric : "—").padEnd(14),
         pct(m.returnPct).padStart(8),
         `${m.maxDrawdownPct.toFixed(1)}%`.padStart(9),
         `${m.timeInRangePct.toFixed(0)}%`.padStart(9),
         `${m.timeParkedPct.toFixed(0)}%`.padStart(8),
         signedUsd(m.feeIncomeUsd).padStart(13),
         signedUsd(m.positionPnlUsd).padStart(15),
-        signedUsd(m.hedgePnlUsd - m.hedgeCostUsd).padStart(12),
         String(m.recenters).padStart(11),
       ].join(""),
     );
