@@ -162,8 +162,41 @@ export function createTransactor(privateKey: `0x${string}`, rpcUrls: string[]): 
         gasUsed: receipt.gasUsed.toString(),
         effectiveGwei: formatGwei(receipt.effectiveGasPrice),
       });
+
+      // A receipt says the transaction is in a block. It does NOT say the next
+      // READ will see its effects: the endpoint answering that read may be a
+      // block or two behind. Every occurrence of this has been silent and
+      // expensive — a stale balance sized a position from a fraction of the
+      // wallet, four separate times. Waiting for the client's head to reach the
+      // receipt's block closes most of the window for every caller at once,
+      // rather than one call site at a time.
+      await waitForHead(client, receipt.blockNumber, label);
       return hash;
   }
+}
+
+/**
+ * Wait until the client reports a chain head at or beyond `blockNumber`.
+ *
+ * Bounded and non-fatal: callers that need a specific balance verify it
+ * themselves, and blocking a live bot on a lagging endpoint would be worse
+ * than proceeding.
+ */
+async function waitForHead(
+  client: import("./client.js").BotClient,
+  blockNumber: bigint,
+  label: string,
+  attempts = 8,
+): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if ((await client.getBlockNumber()) >= blockNumber) return;
+    } catch {
+      // Treat a failed head read like a lagging one and try again.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  logger.warn("RPC head still behind the confirmed transaction", { label, blockNumber });
 }
 
 export function getWalletAddress(transactor: Transactor): `0x${string}` {

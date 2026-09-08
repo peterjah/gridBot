@@ -587,7 +587,18 @@ has been silent — the wrong number, not an error:
 * a swap of 0.0702 WETH → 172.26 USDC confirmed, the read still showed the
   pre-swap 26.21 USDC, and the mint deployed $52 of a $397 book;
 * the park supplied 0.0703 WETH, then found another 0.0167 fifteen minutes
-  later, leaving USDC below the supply threshold stranded in the wallet.
+  later, leaving USDC below the supply threshold stranded in the wallet;
+* two Aave withdrawals confirmed at blocks 51017223/51017224, the plan two
+  seconds later read `balance0: 0`, and 0.0445 WETH — $110 — sat out the whole
+  re-centre cycle.
+
+Guarding one call site at a time has not worked: each fix left the next
+occurrence to be found in production. `Transactor.send` now also waits for the
+client's chain head to reach the receipt's block before returning, which closes
+most of the window for every caller including ones not yet written. The
+per-site guards remain, because the head check narrows the race rather than
+eliminating it — a fallback transport can still answer the next read from a
+different endpoint.
 
 ## Absorbing deposits
 

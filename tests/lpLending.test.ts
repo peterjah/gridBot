@@ -13,13 +13,16 @@ const toRaw = (v: number, decimals: number): bigint =>
   BigInt(Math.round(v * 10 ** Math.min(decimals, 6))) * 10n ** BigInt(Math.max(decimals - 6, 0));
 
 /** An AaveExecutor stand-in that records what it was asked to do. */
-function fakeAave(balances: {
+function fakeAave(initial: {
   usdcWallet: number;
   usdcLent: number;
   ethWallet: number;
   ethLent: number;
 }): { aave: AaveExecutor; calls: Call[] } {
   const calls: Call[] = [];
+  // Mutable, so a withdrawal actually moves the balance the way the chain
+  // does. releaseAll waits for the wallet to show it.
+  const balances = { ...initial };
   const aave = {
     allBalances: async () => balances,
     allBalancesRaw: async () => ({
@@ -32,9 +35,23 @@ function fakeAave(balances: {
     // up above 2^53 and asks for more than the wallet holds.
     supplyRaw: async (asset: "USDC" | "WETH", amount: bigint) => {
       calls.push({ kind: "supply", asset, amount });
+      if (asset === "USDC") {
+        balances.usdcLent += balances.usdcWallet;
+        balances.usdcWallet = 0;
+      } else {
+        balances.ethLent += balances.ethWallet;
+        balances.ethWallet = 0;
+      }
     },
     withdrawMax: async (asset: "USDC" | "WETH") => {
       calls.push({ kind: "withdrawMax", asset, amount: 0n });
+      if (asset === "USDC") {
+        balances.usdcWallet += balances.usdcLent;
+        balances.usdcLent = 0;
+      } else {
+        balances.ethWallet += balances.ethLent;
+        balances.ethLent = 0;
+      }
     },
   } as unknown as AaveExecutor;
   return { aave, calls };
@@ -252,5 +269,52 @@ describe("precision", () => {
     // Kept as an executable note: this is the arithmetic that reverted.
     expect(Math.floor(0.14 * 1e18)).not.toBe(140_000_000_000_000_000);
     expect(BigInt(Math.floor(0.14 * 1e18)) > 140_000_000_000_000_000n).toBe(true);
+  });
+});
+
+/**
+ * The production failure: two aave-withdraw-max transactions confirmed, and
+ * the balance read two seconds later still showed 0 WETH. The plan sized the
+ * new position from USDC alone and 0.0445 WETH — $110 — was left in the
+ * wallet, undeployed, for a whole re-centre cycle.
+ */
+describe("releaseAll visibility", () => {
+  it("does not return until the withdrawn balances are readable", async () => {
+    const state = { usdcWallet: 0, usdcLent: 292.33, ethWallet: 0, ethLent: 0.04452148 };
+    let lag = 2; // the node is two reads behind, as it was live
+    const calls: string[] = [];
+    const aave = {
+      allBalancesRaw: async () => {
+        // While lagging, report the PRE-withdrawal wallet.
+        const visible = lag > 0 ? { usdcWallet: 0, ethWallet: 0 } : {
+          usdcWallet: state.usdcWallet,
+          ethWallet: state.ethWallet,
+        };
+        if (calls.length > 0 && lag > 0) lag--;
+        return {
+          usdcWallet: BigInt(Math.round(visible.usdcWallet * 1e6)),
+          usdcLent: BigInt(Math.round(state.usdcLent * 1e6)),
+          ethWallet: BigInt(Math.round(visible.ethWallet * 1e6)) * 10n ** 12n,
+          ethLent: BigInt(Math.round(state.ethLent * 1e6)) * 10n ** 12n,
+        };
+      },
+      withdrawMax: async (asset: "USDC" | "WETH") => {
+        calls.push(asset);
+        if (asset === "USDC") {
+          state.usdcWallet += state.usdcLent;
+          state.usdcLent = 0;
+        } else {
+          state.ethWallet += state.ethLent;
+          state.ethLent = 0;
+        }
+      },
+    } as unknown as AaveExecutor;
+
+    await new LpLendingManager(aave, { minActionUsd: 1, dryRun: false }).releaseAll(2484);
+
+    // Both legs withdrawn, and it waited out the lag rather than returning
+    // while the wallet still read zero.
+    expect(calls).toEqual(["USDC", "WETH"]);
+    expect(lag).toBe(0);
   });
 });

@@ -41,15 +41,12 @@ export class LpLendingManager {
    * funded from the un-lent remainder and the rest stays idle in Aave.
    */
   async releaseAll(ethPrice: number): Promise<boolean> {
-    const balances = await this.aave.allBalances();
-    const usdcLent = balances.usdcLent;
-    const ethLent = balances.ethLent;
-
-    if (usdcLent <= 0 && ethLent <= 0) return false;
+    const raw = await this.aave.allBalancesRaw();
+    if (raw.usdcLent <= 0n && raw.ethLent <= 0n) return false;
 
     logger.info("Withdrawing from Aave before deploying", {
-      usdcLent: usdcLent.toFixed(6),
-      ethLent: ethLent.toFixed(8),
+      usdcLent: raw.usdcLent.toString(),
+      ethLent: raw.ethLent.toString(),
       ethPriceUsd: ethPrice.toFixed(2),
     });
 
@@ -62,9 +59,45 @@ export class LpLendingManager {
     // Withdrawing dust costs a few cents; under-deploying costs yield. Max
     // withdraw because a computed amount can round one unit above the actual
     // balance and revert — exactly when the bot needs to deploy.
-    if (usdcLent > 0) await this.aave.withdrawMax("USDC");
-    if (ethLent > 0) await this.aave.withdrawMax("WETH");
+    if (raw.usdcLent > 0n) await this.aave.withdrawMax("USDC");
+    if (raw.ethLent > 0n) await this.aave.withdrawMax("WETH");
+
+    // Do not return until the withdrawn tokens are readable. The caller sizes
+    // the new position from the wallet immediately afterwards, and a confirmed
+    // receipt does not mean the next read sees the transfer. Observed live: a
+    // WETH withdrawal confirmed at block 51017224, the plan read 0 WETH two
+    // seconds later, and 0.0445 WETH was left out of the position entirely.
+    await this.awaitWithdrawn(raw.usdcWallet + raw.usdcLent, raw.ethWallet + raw.ethLent);
     return true;
+  }
+
+  /**
+   * Block until the wallet shows the withdrawn balances.
+   *
+   * Proceeds with whatever is visible after the timeout rather than throwing:
+   * a partial view costs a smaller position, refusing to proceed leaves the
+   * capital undeployed entirely.
+   */
+  private async awaitWithdrawn(
+    expectedUsdc: bigint,
+    expectedEth: bigint,
+    attempts = 10,
+  ): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const now = await this.aave.allBalancesRaw();
+      if (now.usdcWallet >= expectedUsdc && now.ethWallet >= expectedEth) {
+        if (i > 0) logger.debug("Withdrawn balances visible after retry", { attempt: i + 1 });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    const now = await this.aave.allBalancesRaw();
+    logger.warn("Withdrawn balances still not fully visible; deploying what is readable", {
+      expectedUsdc: expectedUsdc.toString(),
+      actualUsdc: now.usdcWallet.toString(),
+      expectedEth: expectedEth.toString(),
+      actualEth: now.ethWallet.toString(),
+    });
   }
 
   /**
