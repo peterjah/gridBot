@@ -10,6 +10,8 @@ import {
   loadPositionId,
   loadState,
   markRecentred,
+  measuredFeeApr,
+  recordExposure,
   recordPriceSample,
   saveState,
   trailingMovePct,
@@ -351,6 +353,41 @@ export class Monitor {
       rebalanceDecision: decision ? "REBALANCE" : "HOLD",
       dryRun: this.config.dryRun,
     });
+
+    // Record exposure from what this cycle already read, so the fee rate the
+    // pool actually pays becomes a measurement rather than an estimate
+    // reconstructed from log fragments. Costs no extra RPC.
+    if (position !== null && position.liquidity > 0n) {
+      const { amount0, amount1 } = getAmountsForLiquidity(
+        state.sqrtPriceX96,
+        getSqrtRatioAtTick(position.tickLower),
+        getSqrtRatioAtTick(position.tickUpper),
+        position.liquidity,
+      );
+      const deployedUsd =
+        Number(formatUnits(amount0, this.pool.token0.decimals)) * price +
+        Number(formatUnits(amount1, this.pool.token1.decimals));
+      const inRange =
+        state.currentTick >= position.tickLower && state.currentTick < position.tickUpper;
+      recordExposure(persisted, nowSec, deployedUsd, inRange);
+    } else {
+      // Nothing deployed: advance the clock without crediting exposure, so a
+      // parked stretch cannot dilute the rate.
+      persisted.lastExposureAt = nowSec;
+    }
+    saveState(this.config.stateFile, persisted);
+
+    const rate = measuredFeeApr(persisted);
+    if (rate !== null) {
+      logger.info("Measured fee rate", {
+        feesUsd: persisted.feesUsd.toFixed(4),
+        deployedUsdDays: (persisted.deployedUsdSeconds / 86_400).toFixed(1),
+        deployedDays: (persisted.deployedSeconds / 86_400).toFixed(2),
+        inRangePct: rate.inRangePct.toFixed(1),
+        feeAprPct: rate.overall.toFixed(1),
+        feeAprInRangePct: rate.inRange.toFixed(1),
+      });
+    }
 
     // Remember what this cycle saw, so the next interval can be chosen from a
     // real observation rather than a fixed guess.

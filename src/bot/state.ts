@@ -46,6 +46,26 @@ export interface BotState {
   lastRecenterAt: number;
   /** Observability mirror of the short hedge; the chain (debt balance) decides. */
   hedged: boolean;
+
+  /**
+   * Exposure accounting, for measuring the fee rate the pool actually pays.
+   *
+   * `feesUsd` alone cannot produce a rate: it has to be divided by capital
+   * ACTUALLY at work, and the bot spends most of its life parked or (before
+   * the sizing fixes) partly deployed. Dividing by wall-clock time and
+   * nominal capital understates the rate several-fold, which is why every
+   * figure so far has been a hand-reconstructed estimate.
+   *
+   * Integrating position value over time makes the rate a measurement:
+   *   feeApr = feesUsd / deployedUsdSeconds * secondsPerYear
+   */
+  deployedUsdSeconds: number;
+  /** Seconds with liquidity deployed, regardless of range. */
+  deployedSeconds: number;
+  /** Of those, seconds with the price inside the position's range. */
+  inRangeSeconds: number;
+  /** Unix seconds of the last exposure sample; 0 before the first. */
+  lastExposureAt: number;
 }
 
 export interface PriceSample {
@@ -68,6 +88,10 @@ export function emptyState(): BotState {
     lastParkChangeAt: 0,
     lastRecenterAt: 0,
     hedged: false,
+    deployedUsdSeconds: 0,
+    deployedSeconds: 0,
+    inRangeSeconds: 0,
+    lastExposureAt: 0,
   };
 }
 
@@ -252,6 +276,54 @@ export function seedPriceHistory(
   );
   state.priceHistory = [...seeded, ...existing];
   return seeded.length;
+}
+
+/**
+ * Add one observation of deployed exposure.
+ *
+ * Called every cycle with what the monitor already read, so it costs no extra
+ * RPC. The elapsed time is capped: a restart or a long outage would otherwise
+ * credit the gap as if the position had been deployed and in range throughout,
+ * inflating the denominator and understating the rate.
+ */
+export function recordExposure(
+  state: BotState,
+  nowSeconds: number,
+  deployedUsd: number,
+  inRange: boolean,
+  maxGapSeconds = 3600,
+): void {
+  const last = state.lastExposureAt;
+  state.lastExposureAt = nowSeconds;
+  if (last <= 0 || nowSeconds <= last) return;
+
+  const elapsed = Math.min(nowSeconds - last, maxGapSeconds);
+  if (deployedUsd <= 0) return;
+
+  state.deployedUsdSeconds += deployedUsd * elapsed;
+  state.deployedSeconds += elapsed;
+  if (inRange) state.inRangeSeconds += elapsed;
+}
+
+/**
+ * Fee rate the position actually earned, annualised, or null before there is
+ * enough exposure to divide by.
+ *
+ * `inRange` restates it over only the time the position was earning, which is
+ * the number comparable to a pool's published APR.
+ */
+export function measuredFeeApr(
+  state: BotState,
+): { overall: number; inRange: number; inRangePct: number } | null {
+  if (!(state.deployedUsdSeconds > 0) || !(state.deployedSeconds > 0)) return null;
+  const secondsPerYear = 365 * 24 * 3600;
+  const overall = (state.feesUsd / state.deployedUsdSeconds) * secondsPerYear * 100;
+  const inRangePct = (state.inRangeSeconds / state.deployedSeconds) * 100;
+  return {
+    overall,
+    inRange: inRangePct > 0 ? overall / (inRangePct / 100) : overall,
+    inRangePct,
+  };
 }
 
 /** Ensure the directory of the state file exists. */

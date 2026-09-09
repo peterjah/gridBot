@@ -182,6 +182,56 @@ level — and it is the failure mode no amount of fee income fixes.
 * The unhedged directional exposure is the dominant risk, not the parameters.
   A regime filter or a short hedge addresses it; tuning range width does not.
 
+## Measuring the fee rate
+
+Every fee figure in this document rests on a modelled rate the pool was assumed
+to pay. That assumption has been wrong in the same direction four times, and it
+is the input the whole strategy hinges on: the break-even scan spans −15% to +6%
+mean return depending on it alone.
+
+Refining the model further would not help. Its three suspected flaws — the
+concentration multiplier, no adverse selection, no re-centring latency — all
+collapse into ONE observable: effective fee APR per dollar deployed while in
+range. Modelling them separately means guessing three parameters to reproduce
+one number that can simply be measured.
+
+So the bot measures it. Each cycle integrates what it already reads:
+
+```
+deployedUsdSeconds += positionValue * elapsed
+deployedSeconds    += elapsed
+inRangeSeconds     += elapsed   (when price is inside the range)
+
+feeAprPct = feesUsd / deployedUsdSeconds * secondsPerYear
+```
+
+and reports:
+
+```json
+{"msg":"Measured fee rate","feesUsd":"3.2770","deployedUsdDays":"4000.0",
+ "deployedDays":"10.00","inRangePct":"80.0","feeAprPct":"29.9",
+ "feeAprInRangePct":"37.4"}
+```
+
+Three details that decide whether the number means anything:
+
+* **Capital-weighted, not wall-clock.** Dividing fees by nominal capital and
+  elapsed time understates the rate several-fold whenever the bot is parked or
+  partly deployed — which, before the sizing fixes, was most of its life. The
+  earlier ~27% estimate needed a hand-reconstructed timeline from log fragments
+  precisely because this was not recorded.
+* **The elapsed gap is capped** (default 1h). A restart or an RPC outage would
+  otherwise credit the whole gap as deployed and in-range time, inflating the
+  denominator against fees that were never earned.
+* **`feeAprInRangePct` restates the rate over earning time only.** That is the
+  figure comparable to a pool's published `apyBase`; the overall one is what the
+  strategy actually receives.
+
+Feed the measured rate back as `LP_FEE_APR_PCT` and the sweeps become
+calibrated rather than assumed. It needs weeks of full deployment to settle, and
+it measures this pool at this size — which is the only thing that matters for
+the decision in front of you, and does not generalise.
+
 ## Choosing the regime metric
 
 `trailingMovePct` is net **displacement** — where price ended versus 168h
