@@ -169,6 +169,8 @@ describe("passive LP concentration", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
         },
         flat(2000, 20),
       ).feeIncomeUsd;
@@ -194,6 +196,8 @@ describe("passive LP concentration", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
       },
       flat(3000, 30),
     );
@@ -257,6 +261,8 @@ describe("density-based fee share", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
       },
       prices,
     );
@@ -287,6 +293,8 @@ describe("fee income does not compound into liquidity", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
         },
         Array.from({ length: hours + 1 }, (_, i) => ({
           timestamp: 1_700_000_000 + i * 3600,
@@ -330,6 +338,8 @@ describe("fee compounding at re-centring", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
         },
         flat(hours + 1, 100),
       ).feeIncomeUsd;
@@ -355,6 +365,8 @@ describe("fee compounding at re-centring", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
       },
       data,
     );
@@ -384,6 +396,8 @@ describe("fee attribution survives redeployment", () => {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
       },
       data,
     );

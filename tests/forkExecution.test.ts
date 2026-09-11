@@ -80,6 +80,8 @@ describe.runIf(FORK_URL)("fork execution", () => {
         rangePct: 5,
         recenterBufferPct: 50,
         recenterMinHours: 24,
+        parkDwellHours: 0,
+        unparkDwellHours: 24,
         positionManagerAddress: BASE_CONTRACTS.positionManager,
         swapRouterAddress: BASE_CONTRACTS.swapRouter,
         quoterAddress: BASE_CONTRACTS.quoter,

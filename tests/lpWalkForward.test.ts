@@ -42,6 +42,8 @@ const options: LpWalkForwardOptions = {
       hedgeBorrowAprPct: 3,
       hedgeWhileParkedOnly: false,
       regimeMetric: "displacement" as const,
+      parkDwellHours: 24,
+      unparkDwellHours: 24,
     },
     gas: 0.02,
   },

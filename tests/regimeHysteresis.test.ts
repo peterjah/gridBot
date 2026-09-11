@@ -17,6 +17,8 @@ const cfg = {
   rangePct: 5,
   recenterBufferPct: 50,
   recenterMinHours: 0,
+  parkDwellHours: 0,
+  unparkDwellHours: 0,
   positionManagerAddress: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
   swapRouterAddress: "0x2626664c2603336E57B271c5C0b26F421741e481",
   quoterAddress: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
@@ -55,6 +57,10 @@ interface HarnessOptions {
   hedgeOpen?: boolean;
   /** Force the liquidation guard to report an unwind. */
   hedgeUnhealthy?: boolean;
+  parkDwellHours?: number;
+  unparkDwellHours?: number;
+  /** Seconds since the last park/unpark transition. */
+  lastParkChangeSecondsAgo?: number;
   /** What the strategy says about distance; false means "holding". */
   shouldRebalance?: boolean;
   /** Managed position id; null keeps the bootstrap-mint path. */
@@ -72,7 +78,7 @@ function harness(overrides: HarnessOptions = {}) {
   const lookbackHours = 168;
   const state = emptyState();
   state.parked = overrides.parked ?? false;
-  state.lastParkChangeAt = nowSec - 10_000_000; // dwelled
+  state.lastParkChangeAt = nowSec - (overrides.lastParkChangeSecondsAgo ?? 10_000_000);
   if (overrides.lastRecenterAtSecondsAgo !== undefined) {
     state.lastRecenterAt = nowSec - overrides.lastRecenterAtSecondsAgo;
   }
@@ -112,6 +118,8 @@ function harness(overrides: HarnessOptions = {}) {
       stateFile,
       regimeMaxMovePct: overrides.regimeMaxMovePct ?? 3,
       recenterMinHours: overrides.recenterMinHours ?? 0,
+      parkDwellHours: overrides.parkDwellHours ?? 0,
+      unparkDwellHours: overrides.unparkDwellHours ?? (overrides.recenterMinHours ?? 0),
     },
     null,
     30,
@@ -361,6 +369,42 @@ describe("persisted re-centre cooldown", () => {
     await mockPoolReads(42n);
     await monitor.cycle();
     expect(valued).toBe(false);
+    expect(order).not.toContain("rebalance");
+  });
+
+  /**
+   * The live failure this split exists to prevent: with one shared dwell, the
+   * regime turned hostile 1h45m after a deploy and the close was blocked for a
+   * full day. By the time it fired the market had rolled back to calm, and
+   * closing reset the same timer — locking the bot out of a calm market for
+   * another 24h. Risk response must not wait on the churn guard.
+   */
+  it("closes immediately when the regime turns hostile, however recently it deployed", async () => {
+    const { monitor, order } = harness({
+      movePct: 5,
+      positionId: 42n,
+      parked: false,
+      // Deployed only moments ago: a shared dwell would block this close.
+      lastParkChangeSecondsAgo: 60,
+      unparkDwellHours: 24,
+      parkDwellHours: 0,
+    });
+    await mockPoolReads(42n);
+    await monitor.cycle();
+    expect(order).toContain("closePosition");
+  });
+
+  it("still makes re-entry wait, so the filter cannot thrash", async () => {
+    const { monitor, order } = harness({
+      movePct: 0.5,
+      positionId: null,
+      parked: true,
+      lastParkChangeSecondsAgo: 60,
+      unparkDwellHours: 24,
+      parkDwellHours: 0,
+    });
+    await mockPoolReads(null);
+    await monitor.cycle();
     expect(order).not.toContain("rebalance");
   });
 });

@@ -10,6 +10,8 @@ const baseCfg = {
   rangePct: 5,
   recenterBufferPct: 50,
   recenterMinHours: 24,
+  parkDwellHours: 0,
+  unparkDwellHours: 24,
   positionManagerAddress: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
   swapRouterAddress: "0x2626664c2603336E57B271c5C0b26F421741e481",
   quoterAddress: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",

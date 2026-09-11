@@ -17,6 +17,8 @@ const base: Omit<PassiveLpConfig, "hedgeRatioPct"> = {
   hedgeBorrowAprPct: 3,
   hedgeWhileParkedOnly: false,
   regimeMetric: "displacement" as const,
+  parkDwellHours: 24,
+  unparkDwellHours: 24,
 };
 
 /** A steady one-way move, which is where directional exposure bites. */

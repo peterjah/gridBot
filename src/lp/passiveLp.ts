@@ -74,6 +74,18 @@ export interface PassiveLpConfig {
    */
   regimeMetric: RegimeMetric;
   /**
+   * Minimum hours before the filter may ENTER park, and before it may LEAVE.
+   *
+   * One shared dwell gates both directions and resets on every transition,
+   * which produced this live: the regime turned hostile 1h45m after deploying
+   * and the close was blocked for 24h; when it finally fired the regime had
+   * already rolled back to calm, and closing reset the timer again, locking the
+   * bot out of a calm market for another day. Risk response and churn
+   * protection are different concerns and deserve separate knobs.
+   */
+  parkDwellHours: number;
+  unparkDwellHours: number;
+  /**
    * Percent of the position's ETH exposure held short, 0 = unhedged.
    *
    * A concentrated LP position is structurally long the volatile asset, and
@@ -408,8 +420,10 @@ export function runPassiveLp(
     // in between. The same dwell time as re-centring keeps it from churning.
     if (cfg.regimeMaxMovePct > 0) {
       const hostile = regimeHostile(i);
-      const dwelled = point.timestamp - lastParkChangeAt >= cfg.recenterMinHours * 3600;
-      if (hostile && !parked && dwelled) {
+      const sinceChange = point.timestamp - lastParkChangeAt;
+      const mayPark = sinceChange >= cfg.parkDwellHours * 3600;
+      const mayUnpark = sinceChange >= cfg.unparkDwellHours * 3600;
+      if (hostile && !parked && mayPark) {
         const h = holdingsOf(position, point.price);
         const value = h.eth * point.price + h.usdc;
         const cost = h.eth * point.price * costFrac;
@@ -421,7 +435,7 @@ export function runPassiveLp(
         parkEvents++;
         lastParkChangeAt = point.timestamp;
         resizeHedge(point.price);
-      } else if (!hostile && parked && dwelled) {
+      } else if (!hostile && parked && mayUnpark) {
         // Re-enter with everything, including fees collected before parking.
         const capital = parkedCash + feeCash;
         const fresh = openPosition(Math.max(capital, 0), point.price, cfg.rangePct);

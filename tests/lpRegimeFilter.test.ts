@@ -17,6 +17,8 @@ const base: Omit<PassiveLpConfig, "regimeMaxMovePct"> = {
   hedgeBorrowAprPct: 3,
   hedgeWhileParkedOnly: false,
   regimeMetric: "displacement" as const,
+  parkDwellHours: 24,
+  unparkDwellHours: 24,
 };
 
 /** Flat for `calm` points, then a steady one-way ramp. */

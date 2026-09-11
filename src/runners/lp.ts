@@ -50,6 +50,10 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       regimeLookbackPoints: cfg.grid.regimeLookbackPoints,
       hedgeRatioPct: 0,
       regimeMetric: "displacement",
+      // Both default to the re-centre cooldown, reproducing the single shared
+      // dwell the model had before they were split.
+      parkDwellHours: cfg.lpRebalance.recenterMinHours,
+      unparkDwellHours: cfg.lpRebalance.recenterMinHours,
       hedgeBorrowAprPct: cfg.hedgeBorrowAprPct,
       // Model the continuous hedge by default: the shipped live hedge only
       // covers the parked leg, and the exposure that loses money is the LP

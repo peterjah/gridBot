@@ -401,11 +401,14 @@ export class Monitor {
     // A hostile regime overrides everything: close to cash and stay there.
     // The dwell time is the same one that rate-limits re-centring, so the
     // filter cannot thrash the position in and out on every poll.
-    const dwelled =
-      nowSec - persisted.lastParkChangeAt >= this.config.recenterMinHours * 3600;
+    // Separate dwells: responding to risk should not wait, but re-entering
+    // should, or the filter thrashes. See LpRebalanceConfig.
+    const sinceParkChange = nowSec - persisted.lastParkChangeAt;
+    const mayPark = sinceParkChange >= this.config.parkDwellHours * 3600;
+    const mayUnpark = sinceParkChange >= this.config.unparkDwellHours * 3600;
 
     if (hostile) {
-      if (position && position.liquidity > 0n && dwelled) {
+      if (position && position.liquidity > 0n && mayPark) {
         await this.executor.closePosition(position, state.sqrtPriceX96);
         if (!this.config.dryRun) {
           const after = loadState(this.config.stateFile);
@@ -417,7 +420,7 @@ export class Monitor {
         logger.info("Hostile regime — standing aside", {
           trailingMovePct: move === null ? null : Number(move.toFixed(2)),
           deployed: position ? position.liquidity > 0n : false,
-          dwelled,
+          mayPark,
         });
       }
 
@@ -466,7 +469,7 @@ export class Monitor {
       // Insufficient history is not evidence of a big move — same convention
       // as the exit path, which stays invested until the window fills.
       const calmEnough = move === null || Math.abs(move) <= reenterMaxPct;
-      if (!dwelled) {
+      if (!mayUnpark) {
         logger.info("Regime calm but dwell time not elapsed — staying in cash", {
           recenterMinHours: this.config.recenterMinHours,
         });

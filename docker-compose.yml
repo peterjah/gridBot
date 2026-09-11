@@ -24,6 +24,9 @@ services:
       LP_RANGE_PCT: "${LP_RANGE_PCT:-5}"
       LP_RECENTER_BUFFER_PCT: "${LP_RECENTER_BUFFER_PCT:-50}"
       LP_RECENTER_MIN_HOURS: "${LP_RECENTER_MIN_HOURS:-24}"
+      # Split dwell: respond to risk at once, re-enter slowly.
+      LP_PARK_DWELL_HOURS: "${LP_PARK_DWELL_HOURS:-0}"
+      LP_UNPARK_DWELL_HOURS: "${LP_UNPARK_DWELL_HOURS:-24}"
       LP_SLIPPAGE_BPS: "${LP_SLIPPAGE_BPS:-50}"
       # Adaptive polling. POLL_INTERVAL_SECONDS is the FLOOR, used when
       # something is close to acting; the interval backs off toward

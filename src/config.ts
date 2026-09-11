@@ -107,6 +107,21 @@ export interface LpRebalanceConfig {
   recenterBufferPct: number;
   /** Minimum hours between re-centres. Mirrors the backtest cooldown. */
   recenterMinHours: number;
+  /**
+   * Minimum hours before the regime filter may ENTER park, and before it may
+   * LEAVE. Separate because they protect against different things.
+   *
+   * A single shared dwell made the bot respond to risk a day late and then
+   * lock itself out of the recovery: the regime turned hostile 1h45m after a
+   * deploy, the close was blocked for 24h, and by the time it fired the market
+   * had already calmed — closing then reset the timer for another day.
+   *
+   * Park defaults to 0: a risk response should not wait. Re-entry keeps the
+   * full cooldown, which is what actually prevents thrashing — measured, no
+   * dwell at all produces 627 park events and -8.6% mean against +3.6%.
+   */
+  parkDwellHours: number;
+  unparkDwellHours: number;
   positionManagerAddress: `0x${string}`;
   swapRouterAddress: `0x${string}`;
   quoterAddress: `0x${string}`;
@@ -451,6 +466,8 @@ export function loadConfig(mode: Mode): AppConfig {
         rangePct,
         recenterBufferPct: bufferPct,
         recenterMinHours: num("LP_RECENTER_MIN_HOURS", 24),
+        parkDwellHours: num("LP_PARK_DWELL_HOURS", 0),
+        unparkDwellHours: num("LP_UNPARK_DWELL_HOURS", num("LP_RECENTER_MIN_HOURS", 24)),
         positionManagerAddress: contracts.positionManager,
         swapRouterAddress: contracts.swapRouter,
         quoterAddress: contracts.quoter,

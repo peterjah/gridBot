@@ -182,6 +182,44 @@ level — and it is the failure mode no amount of fee income fixes.
 * The unhedged directional exposure is the dominant risk, not the parameters.
   A regime filter or a short hedge addresses it; tuning range width does not.
 
+## The dwell timer, split by direction
+
+The filter's dwell prevents thrashing, and it is genuinely needed: removing it
+entirely produces 627 park events across the folds and **−8.60%** mean against
++3.64%. But one shared timer gating both directions failed live.
+
+Observed 2026-09-10/11: the bot deployed, the regime turned hostile 1h45m
+later, and the close was blocked because the dwell had not elapsed. It held the
+risk for a full day. When the timer finally allowed the close, the market had
+already rolled back to calm — so it sold late, into conditions it wanted to be
+invested in, and closing reset the same timer and locked it out for another
+22.7 hours.
+
+Risk response and churn protection are different concerns:
+
+| park / unpark dwell | mean (model) | worst | mean (×0.35 fees) | worst | parks |
+| --- | --- | --- | --- | --- | --- |
+| 24 / 24 *(old)* | +3.64% | −8.7% | −4.47% | −14.8% | 66 |
+| **0 / 24** | +3.26% | **−6.6%** | **−1.64%** | **−10.3%** | 104 |
+| 12 / 12 | **+4.22%** | −8.5% | −3.91% | −14.7% | 105 |
+| 6 / 6 | −3.23% | −18.6% | −10.94% | −24.2% | 147 |
+| 24 / 0 | −1.53% | −16.9% | −12.17% | −24.7% | 105 |
+| 0 / 0 | −8.60% | −24.4% | −15.78% | −29.9% | 627 |
+
+`LP_PARK_DWELL_HOURS` now defaults to **0** and `LP_UNPARK_DWELL_HOURS` to 24.
+
+Three things the table settles:
+
+* **Shortening both** (6/6) is much worse, not a compromise — churn costs more
+  than late risk response.
+* **The asymmetry has to point this way.** Fast re-entry with slow parking
+  (24/0) is worse than the old behaviour under both fee assumptions.
+* **0/24 wins where it matters.** It gives up 0.4 points of mean under the
+  model's own fee rate, and gains 2.8 points plus a materially better tail
+  under the live-calibrated one — which is the assumption the live measurement
+  keeps pointing toward. It parks more often (104 vs 66) and more of the time,
+  which is the intended behaviour: it is responding rather than waiting.
+
 ## Measuring the fee rate
 
 Every fee figure in this document rests on a modelled rate the pool was assumed
