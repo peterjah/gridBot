@@ -220,6 +220,42 @@ Three things the table settles:
   keeps pointing toward. It parks more often (104 vs 66) and more of the time,
   which is the intended behaviour: it is responding rather than waiting.
 
+## Crediting yield on parked capital
+
+The live bot lends idle capital to Aave whenever the filter stands aside
+(`ENABLE_AAVE`), so parked capital is not idle. The model credited it nothing,
+which penalised exactly the configurations that park most — and those are the
+ones the filter produces.
+
+`PARKED_YIELD_APR_PCT` fixes that. At 4% (a representative Base USDC supply
+rate), on the live-measured fee rate:
+
+| regime | parked | no yield | Aave 4% | gain |
+| --- | --- | --- | --- | --- |
+| off | 0% | −1.44% | −1.44% | 0.00 |
+| 3% | 76% | +4.81% | +5.53% | **+0.72** |
+| 4% | 67% | +7.75% | +8.41% | +0.66 |
+| 5% | 60% | +2.19% | +2.77% | +0.57 |
+| 10% | 31% | +2.29% | +2.54% | +0.25 |
+
+The effect is proportional to parked time, as it should be, and it is not
+decisive — about 0.7 points per 0.23-year fold at the settings in use. But it
+is the same order as the gaps being argued over when choosing between
+configurations, and it always favours parking, so leaving it out biased every
+such comparison in one direction.
+
+It is reported as income rather than position performance: interest accrues
+into the parked cash balance and would otherwise read as the position having
+appreciated while holding nothing. The accounting identity becomes
+
+```
+finalValue = initialCapital + positionPnl + feeIncome + parkedYield
+             - swapCosts - gas + hedgePnl - hedgeCost
+```
+
+Default is **0**, which reproduces every earlier result. Set it to what the
+money market actually pays before using the sweeps to choose a configuration.
+
 ## Measuring the fee rate
 
 Every fee figure in this document rests on a modelled rate the pool was assumed

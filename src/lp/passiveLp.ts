@@ -86,6 +86,17 @@ export interface PassiveLpConfig {
   parkDwellHours: number;
   unparkDwellHours: number;
   /**
+   * Supply APR earned on capital while parked, percent.
+   *
+   * The live bot lends idle capital to Aave whenever the regime filter stands
+   * aside (`ENABLE_AAVE`), so parked capital is not idle. Crediting nothing
+   * for it penalises exactly the configurations that park most — a filter at
+   * 76% parked forgoes roughly 3% annualised that it actually earns.
+   *
+   * 0 reproduces the previous behaviour.
+   */
+  parkedYieldAprPct: number;
+  /**
    * Percent of the position's ETH exposure held short, 0 = unhedged.
    *
    * A concentrated LP position is structurally long the volatile asset, and
@@ -159,6 +170,8 @@ export interface PassiveLpResult {
   hedgeCostUsd: number;
   /** Times the short was opened, closed or resized. */
   hedgeRebalances: number;
+  /** Interest earned on capital while parked. */
+  parkedYieldUsd: number;
   /** Value vs holding the initial deposit split unchanged (divergence loss). */
   impermanentLossUsd: number;
   residual: number;
@@ -204,8 +217,8 @@ function openPosition(capital: number, price: number, rangePct: number): Positio
  * Simulate a passive LP position over the price series.
  *
  * Accounting identity, checked by `residual`:
- *   finalValue = initialCapital + positionPnl + feeIncome - swapCosts - gas
- *                + hedgePnl - hedgeCost
+ *   finalValue = initialCapital + positionPnl + feeIncome + parkedYield
+ *                - swapCosts - gas + hedgePnl - hedgeCost
  */
 export function runPassiveLp(
   cfg: PassiveLpConfig,
@@ -246,6 +259,7 @@ export function runPassiveLp(
   let parked = false;
   let parkedCash = 0;
   let parkEvents = 0;
+  let parkedYieldUsd = 0;
   let parkedCount = 0;
   let lastParkChangeAt = first.timestamp;
 
@@ -370,6 +384,15 @@ export function runPassiveLp(
     // Fees accrue on the position's value while in range, at the pool's
     // measured rate. Out of range the position is entirely one asset and
     // earns nothing — the central trade-off of concentrated liquidity.
+    // Parked capital is lent, not idle. Accrue before anything else moves it,
+    // so a park/unpark in this step does not earn twice.
+    if (parked && parkedCash > 0 && elapsed > 0 && cfg.parkedYieldAprPct > 0) {
+      const earned =
+        parkedCash * (cfg.parkedYieldAprPct / 100) * (elapsed / SECONDS_PER_YEAR);
+      parkedCash += earned;
+      parkedYieldUsd += earned;
+    }
+
     // Short leg marked to market: it gains when price falls, which is exactly
     // the offset to the LP's long exposure.
     if (shortEth !== 0) {
@@ -540,13 +563,16 @@ export function runPassiveLp(
   const hodlExact = startHoldings.eth * last.price + startHoldings.usdc;
 
   // Fees folded into the position are income, not position performance, so
-  // they are removed here and reported under feeIncomeUsd instead.
+  // they are removed here and reported under feeIncomeUsd instead. Interest
+  // earned while parked is income too: it accrues into parkedCash and would
+  // otherwise read as the position having appreciated while holding nothing.
   const positionPnlUsd =
-    positionValue - initialCapital - redeployedFees + swapCostUsd + gasUsd;
+    positionValue - initialCapital - redeployedFees - parkedYieldUsd + swapCostUsd + gasUsd;
   const reconstructed =
     initialCapital +
     positionPnlUsd +
-    feeIncomeTotal -
+    feeIncomeTotal +
+    parkedYieldUsd -
     swapCostUsd -
     gasUsd +
     hedgePnlUsd -
@@ -572,6 +598,7 @@ export function runPassiveLp(
     hedgePnlUsd,
     hedgeCostUsd,
     hedgeRebalances,
+    parkedYieldUsd,
     impermanentLossUsd: positionValue - hodlExact,
     residual: reconstructed - finalValue,
   };

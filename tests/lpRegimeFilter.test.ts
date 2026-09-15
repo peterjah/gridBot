@@ -17,6 +17,7 @@ const base: Omit<PassiveLpConfig, "regimeMaxMovePct"> = {
   hedgeBorrowAprPct: 3,
   hedgeWhileParkedOnly: false,
   regimeMetric: "displacement" as const,
+  parkedYieldAprPct: 0,
   parkDwellHours: 24,
   unparkDwellHours: 24,
 };

@@ -73,6 +73,7 @@ describe.runIf(FORK_URL)("fork execution", () => {
       maxPollIntervalSeconds: 900,
       hedgePollIntervalSeconds: 120,
       hedgeBorrowAprPct: 3,
+      parkedYieldAprPct: 0,
       hedgeMinHealthFactor: 1.6,
       lpRebalance: {
         widthTicks: 488,

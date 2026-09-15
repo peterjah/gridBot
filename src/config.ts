@@ -230,6 +230,14 @@ export interface AppConfig {
   gas: GasModel;
   /** Annualised WETH borrow rate used to cost the modelled short hedge. */
   hedgeBorrowAprPct: number;
+  /**
+   * Supply APR credited to capital while the regime filter is parked.
+   *
+   * The live bot lends it to Aave (ENABLE_AAVE), so crediting nothing
+   * penalises the configurations that park most. Set it to the rate the
+   * money market actually pays; 0 disables.
+   */
+  parkedYieldAprPct: number;
   /** Charge money-market legs on trading transactions. */
   lendingGasLegs: boolean;
   grid: GridSettings;
@@ -381,6 +389,7 @@ export function loadConfig(mode: Mode): AppConfig {
     },
     lendingGasLegs: bool("GAS_LENDING_LEGS", false),
     hedgeBorrowAprPct: num("HEDGE_BORROW_APR_PCT", 3),
+    parkedYieldAprPct: num("PARKED_YIELD_APR_PCT", 0),
     // Aave lending of idle liquidity (defaults = official Base deployments)
     lendingEnabled: (env("ENABLE_AAVE") ?? "false").toLowerCase() === "true",
     aavePool: contracts.aavePool,
