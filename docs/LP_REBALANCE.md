@@ -197,7 +197,7 @@ invested in, and closing reset the same timer and locked it out for another
 
 Risk response and churn protection are different concerns:
 
-| park / unpark dwell | mean (model) | worst | mean (×0.35 fees) | worst | parks |
+| park / unpark dwell | mean (52% APR) | worst | mean (×0.35 fees) | worst | parks |
 | --- | --- | --- | --- | --- | --- |
 | 24 / 24 *(old)* | +3.64% | −8.7% | −4.47% | −14.8% | 66 |
 | **0 / 24** | +3.26% | **−6.6%** | **−1.64%** | **−10.3%** | 104 |
@@ -266,7 +266,11 @@ Three details that decide whether the number means anything:
   strategy actually receives.
 
 Feed the measured rate back as `LP_FEE_APR_PCT` and the sweeps become
-calibrated rather than assumed. It needs weeks of full deployment to settle, and
+calibrated rather than assumed. `feeAprPct` is the rate earned per dollar
+deployed, which corresponds to the **input APR series** the model scales — not
+to its internal post-concentration figure. Comparing the two directly is how an
+earlier version of `docs/OPEN_DECISION.md` came to claim a break-even of 120%
+when the real figure is 28–30%. It needs weeks of full deployment to settle, and
 it measures this pool at this size — which is the only thing that matters for
 the decision in front of you, and does not generalise.
 

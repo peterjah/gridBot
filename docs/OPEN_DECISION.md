@@ -6,22 +6,41 @@ this repository is instrumentation for taking it.
 ## The question
 
 Out-of-sample walk-forward return depends almost entirely on the fee rate the
-pool actually pays, and nothing else moves the answer as much:
+pool actually pays, and nothing else moves the answer as much. Scaling the
+input APR series, ±5% band with the regime filter at 3%:
 
-| fee scale | implied APR | ±5% band mean | ±3% | ±2% |
-| --- | --- | --- | --- | --- |
-| ×1.00 | 140% *(model)* | +3.6% | +4.2% | +6.3% |
-| ×0.80 | 112% | +1.1% | +0.3% | +1.3% |
-| ×0.60 | 84% | −1.4% | −3.5% | −3.5% |
-| ×0.35 | 50% *(pool apyBase median)* | −5.7% | −9.9% | −11.4% |
-| ×0.19 | 27% *(rough live estimate)* | −6.3% | −10.8% | −12.5% |
+| input fee APR | mean fold (0.23y) | annualised | vs ETH hold |
+| --- | --- | --- | --- |
+| 52% *(series as fetched)* | +3.26% | +19.9% | +12.8% |
+| 42% | +1.73% | +11.6% | +11.3% |
+| 34% | +0.60% | +5.9% | +10.2% |
+| 31% | +0.22% | +4.0% | +9.8% |
+| 26% | −0.53% | +0.4% | +9.0% |
+| 23% | −0.90% | −1.3% | +8.7% |
 
-**Break-even is around 120% fee APR.** Below it, every band and every
-configuration is negative out of sample.
+**Break-even is around 28–30% fee APR** — the point where a fold ends with the
+same dollars it started. The more honest bar is slightly higher: idle capital
+earns ~4% in Aave with no divergence loss and no gas, and that is met at ~31%.
 
-The model says 140%. The pool's published `apyBase` median is ~50%. A rough
-live estimate over ten badly-under-deployed days suggested ~27%. Those cannot
-all be right, and the strategy is viable under only the first.
+Measured live so far: **63.2%**, over only 2.13 deployed-days at 100% in range
+(2026-09-15). That is above break-even, but the sample is far too small and has
+never been tested out of range, which is where the rate falls.
+
+### A correction worth remembering
+
+An earlier version of this file claimed break-even was **~120% fee APR** and
+that the strategy was viable under none of the candidate rates. That was wrong.
+
+The scan multiplied the input APR *series* by a scale factor, then labelled the
+columns with the model's **post-concentration** implied rate for a ±5% band
+(~140% at ×1.00). But the concentration multiplier is applied inside the model,
+not to the input — so the labels were inflated by roughly 2.7× against the
+quantity actually being varied. The scale factors and the returns were correct;
+only the APR labels attached to them were wrong.
+
+Compare like with like: the number the bot measures (`feeAprPct`) is the rate
+earned per dollar deployed, which corresponds to the **input series**, not to
+the model's internal post-concentration figure.
 
 ## What to do
 
@@ -42,17 +61,17 @@ all be right, and the strategy is viable under only the first.
 
 ## How to read the answer
 
-* **Measured ≳ 120%** — the model was right, the strategy is viable, and the
-  narrow-band configurations become worth revisiting (±2% measured best under
-  the model's own fee assumption).
-* **Measured ≈ 50%** — in line with the pool's published rate, meaning
-  concentration delivers nothing. Every configuration is negative; the
-  strategy does not work at this size on this pool.
-* **Measured ≈ 27%** — worse than the published rate, implying adverse
-  selection on top. Same conclusion, more firmly.
+* **Measured ≳ 50%** — comfortably above break-even. At the series rate the
+  folds give ~+20% annualised and ~+13% over holding ETH. Viable, and worth
+  re-running the band and threshold sweeps calibrated before scaling up.
+* **Measured ≈ 30%** — at break-even. The strategy returns roughly nothing
+  after divergence loss and costs, and the capital would do as well in Aave
+  for none of the risk.
+* **Measured ≲ 25%** — below break-even. The strategy does not work at this
+  size on this pool.
 
-The second and third outcomes are not failures of the exercise. Establishing
-that a strategy does not work, with evidence, is the result.
+The last outcome is not a failure of the exercise. Establishing that a strategy
+does not work, with evidence, is the result.
 
 ## What is already settled
 
