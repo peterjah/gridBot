@@ -80,16 +80,46 @@ These held up across every correction and do not need re-testing:
 * **Earning the pool fee beats paying it.** −26.4% vs +113.4% on identical
   data, same strategy, only the cost structure differing. The most robust
   finding here.
-* **The regime filter helps, and helps more as fees fall.** Off vs on:
-  −7.8% → +3.6% under the model, −29.8% → −6.4% under the live-calibrated
-  rate. Its benefit is constant while its cost shrinks with the fee rate.
+* **The regime filter helps, and its edge shrinks as fees rise.** Off vs best
+  threshold: −7.8% → +5.7% at 52% APR, −1.4% → +7.8% at 63%, +8.9% → +11.0% at
+  78%. Its benefit is roughly constant while its cost — fees forgone while
+  parked — grows with the rate. Above ~80% it is nearly worthless.
 * **Realized volatility is not a better regime metric than displacement**, and
   a signed (falls-only) variant measured worse than absolute.
 * **The hedge as shipped is the wrong tool** while parked, where the ETH can
   simply be sold. It stays off. See docs/LP_REBALANCE.md.
 * **The distance re-centre trigger is effectively dead** — the regime filter
-  fires first 88% of the time. Fixing that coherence problem only pays in a
-  fee regime we have no evidence for, so the band stays at ±5%.
+  fires first 88% of the time, so `LP_RECENTER_BUFFER_PCT` tunes a mechanism
+  that rarely acts.
+
+## Reopened by the corrected fee rate
+
+The band width was settled at ±5% on the argument that "at realistic fees, wide
+bands lose least". That rested on the mislabelled columns: the panel it cited
+was running at ~10% APR, not the ~27% it was labelled. At the rate actually
+measured, the ranking reverses.
+
+±5% band, regime 3%, dwell 0/24, at the live-measured rate:
+
+| band | mean | worst | profitable | re-centres |
+| --- | --- | --- | --- | --- |
+| ±5% *(current)* | +4.81% | −5.5% | 3/4 | 3 |
+| ±3% | +5.08% | −1.7% | 3/4 | 12 |
+| **±2%** | **+5.49%** | **+2.1%** | **4/4** | 19 |
+| ±1.5% | +5.31% | +2.8% | 4/4 | 25 |
+
+±2% is the only configuration in this project where every out-of-sample fold
+made money. It is **not** a recommendation yet: tight bands lean hardest on the
+concentration multiplier, which is the part of the model the live measurement
+exists to test, and 19 re-centres against 3 is six times the exposure to the
+transaction path where every bug this month has lived.
+
+Decide it with a measured `LP_FEE_APR_PCT`, not before.
+
+The dwell choice is also closer than it looked. At realistic rates 24/24 beats
+0/24 on mean (+6.26% vs +4.81%); 0/24 is kept for its better tail and because
+the live failure it fixes — holding risk for a day because a churn guard
+blocked the response — is a defect regardless of the mean.
 
 ## Standing caveat
 
