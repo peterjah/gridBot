@@ -53,6 +53,7 @@ export async function runLpMode(cfg: AppConfig): Promise<void> {
       // Both default to the re-centre cooldown, reproducing the single shared
       // dwell the model had before they were split.
       regimeReenterMarginPct: cfg.lpRebalance.regimeReenterMarginPct,
+      parkToCash: false,
       parkedYieldAprPct: cfg.parkedYieldAprPct,
       parkDwellHours: cfg.lpRebalance.recenterMinHours,
       unparkDwellHours: cfg.lpRebalance.recenterMinHours,

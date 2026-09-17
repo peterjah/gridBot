@@ -22,6 +22,7 @@ const base: Omit<PassiveLpConfig, "parkedYieldAprPct"> = {
   parkDwellHours: 0,
   unparkDwellHours: 24,
   regimeReenterMarginPct: 25,
+  parkToCash: false,
 };
 
 /** Calm, then a sustained ramp that keeps the filter parked. */

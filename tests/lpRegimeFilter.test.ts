@@ -18,6 +18,7 @@ const base: Omit<PassiveLpConfig, "regimeMaxMovePct"> = {
   hedgeWhileParkedOnly: false,
   regimeMetric: "displacement" as const,
   regimeReenterMarginPct: 25,
+  parkToCash: false,
   parkedYieldAprPct: 0,
   parkDwellHours: 24,
   unparkDwellHours: 24,
@@ -52,11 +53,18 @@ describe("LP regime filter", () => {
     expect(on.timeParkedPct).toBeGreaterThan(0);
   });
 
-  it("cuts the loss of a one-way crash", () => {
+  /**
+   * Parking stops the bleed from re-centring into a decline and from paying
+   * fees on it, but it does NOT rescue the position: the book keeps the mix it
+   * held, and a position that went out of range downward is mostly ETH.
+   */
+  it("stops re-centring into a crash without escaping it", () => {
     const data = calmThenCrash(100, 300, 50);
     const off = runPassiveLp({ ...base, regimeMaxMovePct: 0 }, data, 0.02);
     const on = runPassiveLp({ ...base, regimeMaxMovePct: 5 }, data, 0.02);
-    expect(on.returnPct).toBeGreaterThan(off.returnPct);
+    expect(on.recenters.length).toBeLessThan(off.recenters.length);
+    // Both still take most of the move.
+    expect(Math.abs(on.returnPct - off.returnPct)).toBeLessThan(5);
   });
 
   it("keeps the accounting identity with the filter active", () => {
@@ -99,11 +107,20 @@ describe("LP regime filter", () => {
     }
   });
 
-  it("holds no ETH while parked", () => {
+  it("keeps the position's token mix while parked, rather than going to cash", () => {
     const on = runPassiveLp({ ...base, regimeMaxMovePct: 5 }, calmThenCrash(100, 300), 0.02);
-    for (const s of on.samples) {
-      if (s.parked) expect(s.eth).toBe(0);
-    }
+    const parked = on.samples.filter((s) => s.parked);
+    expect(parked.length).toBeGreaterThan(0);
+    // The live bot does not consolidate at park, so ETH is still held.
+    expect(parked.some((s) => s.eth > 0)).toBe(true);
+  });
+
+  it("charges no swap for parking, since none happens", () => {
+    const data = calmThenCrash(100, 300);
+    const on = runPassiveLp({ ...base, regimeMaxMovePct: 5 }, data, 0.02);
+    // Gas yes, swap cost no — until re-entry rebalances toward the new range.
+    expect(on.gasUsd).toBeGreaterThan(0);
+    expect(on.parkEvents).toBeGreaterThan(0);
   });
 
   it("respects the dwell time between park changes", () => {

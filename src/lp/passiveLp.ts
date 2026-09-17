@@ -96,6 +96,18 @@ export interface PassiveLpConfig {
    */
   regimeReenterMarginPct: number;
   /**
+   * Sell the base side when parking, holding pure quote until re-entry.
+   *
+   * The live bot does NOT do this: `closePosition` leaves whatever mix the
+   * position held. That matters more than it sounds — a parked book that keeps
+   * its ETH still takes the move the filter was meant to avoid, and measured
+   * on the folds the filter stops helping entirely (−2.68% against −1.44% for
+   * no filter). Selling at park costs one swap and restores it (+3.70%).
+   *
+   * false reproduces the live bot. Set true to score the alternative.
+   */
+  parkToCash: boolean;
+  /**
    * Supply APR earned on capital while parked, percent.
    *
    * The live bot lends idle capital to Aave whenever the regime filter stands
@@ -255,9 +267,15 @@ export function runPassiveLp(
   let swapCostUsd = 0;
   let gasUsd = 0;
   let lastRecenterAt = first.timestamp;
-  // Regime filter state. `parkedCash` holds the position's value while it is
-  // closed; fees do not accrue on it, which is exactly the cost of standing
-  // aside.
+  // Regime filter state. While parked the book is held as loose tokens in
+  // whatever mix the position had, NOT swapped to cash: `closePosition` in the
+  // live bot deliberately does not consolidate, because an out-of-range
+  // position is already one-sided and re-entry needs both tokens back anyway.
+  //
+  // Modelling it as pure cash was wrong twice over: it charged a swap that is
+  // never paid, and it credited the filter with removing directional exposure
+  // that is in fact retained. Observed live, parked books held 35% and 61% of
+  // their value in ETH.
   // Short leg. `shortEth` is the ETH-denominated size currently borrowed and
   // sold; it is resized only at transaction points (re-centre, park, unpark),
   // so delta drifts between them exactly as it would on-chain.
@@ -267,7 +285,10 @@ export function runPassiveLp(
   let hedgeRebalances = 0;
 
   let parked = false;
-  let parkedCash = 0;
+  let parkedEth = 0;
+  let parkedUsdc = 0;
+  /** Parked value at the current price. */
+  const parkedValue = (price: number): number => parkedEth * price + parkedUsdc;
   let parkEvents = 0;
   let parkedYieldUsd = 0;
   let parkedCount = 0;
@@ -279,7 +300,7 @@ export function runPassiveLp(
 
   /** ETH the book is long right now, whether deployed or parked in cash. */
   const ethExposure = (price: number): number => {
-    if (parked) return 0; // parked cash is USDC in this model
+    if (parked) return parkedEth; // the parked book keeps its ETH side
     return holdingsOf(position, price).eth;
   };
 
@@ -304,9 +325,9 @@ export function runPassiveLp(
       return {
         timestamp: point.timestamp,
         price: point.price,
-        portfolioValue: parkedCash + feeCash + hedgePnlUsd - hedgeCostUsd,
-        eth: 0,
-        usdc: parkedCash,
+        portfolioValue: parkedValue(point.price) + feeCash + hedgePnlUsd - hedgeCostUsd,
+        eth: parkedEth,
+        usdc: parkedUsdc,
         feeCash,
         inRange: false,
         parked: true,
@@ -396,10 +417,12 @@ export function runPassiveLp(
     // earns nothing — the central trade-off of concentrated liquidity.
     // Parked capital is lent, not idle. Accrue before anything else moves it,
     // so a park/unpark in this step does not earn twice.
-    if (parked && parkedCash > 0 && elapsed > 0 && cfg.parkedYieldAprPct > 0) {
+    if (parked && elapsed > 0 && cfg.parkedYieldAprPct > 0) {
+      // Both sides are lent to Aave, so both earn; the rate is applied to the
+      // whole parked value at the current price.
       const earned =
-        parkedCash * (cfg.parkedYieldAprPct / 100) * (elapsed / SECONDS_PER_YEAR);
-      parkedCash += earned;
+        parkedValue(point.price) * (cfg.parkedYieldAprPct / 100) * (elapsed / SECONDS_PER_YEAR);
+      parkedUsdc += earned;
       parkedYieldUsd += earned;
     }
 
@@ -462,29 +485,48 @@ export function runPassiveLp(
       const mayPark = sinceChange >= cfg.parkDwellHours * 3600;
       const mayUnpark = sinceChange >= cfg.unparkDwellHours * 3600;
       if (hostile && !parked && mayPark) {
+        // Withdraw to loose tokens and hold the mix. No swap: the live bot
+        // does not consolidate at park, so charging one here would invent a
+        // cost AND remove exposure that is actually retained.
         const h = holdingsOf(position, point.price);
-        const value = h.eth * point.price + h.usdc;
-        const cost = h.eth * point.price * costFrac;
         const txGas = gasModel.txOverheadUsd + gasModel.perFillUsd;
-        swapCostUsd += cost;
         gasUsd += txGas;
-        parkedCash = Math.max(value - cost - txGas, 0);
+        if (cfg.parkToCash) {
+          // Consolidate to quote: one swap, and the parked book carries no
+          // directional exposure.
+          const cost = h.eth * point.price * costFrac;
+          swapCostUsd += cost;
+          parkedEth = 0;
+          parkedUsdc = Math.max(h.eth * point.price + h.usdc - cost - txGas, 0);
+        } else {
+          parkedEth = h.eth;
+          // Gas comes out of the quote side, or the base side if there is none.
+          parkedUsdc = h.usdc - txGas;
+          if (parkedUsdc < 0) {
+            parkedEth = Math.max(parkedEth + parkedUsdc / point.price, 0);
+            parkedUsdc = 0;
+          }
+        }
         parked = true;
         parkEvents++;
         lastParkChangeAt = point.timestamp;
         resizeHedge(point.price);
       } else if (calmEnough && parked && mayUnpark) {
         // Re-enter with everything, including fees collected before parking.
-        const capital = parkedCash + feeCash;
+        const capital = parkedValue(point.price) + feeCash;
         const fresh = openPosition(Math.max(capital, 0), point.price, cfg.rangePct);
         const target = holdingsOf(fresh, point.price);
-        const cost = target.eth * point.price * costFrac;
+        // Only the difference between what is held and what the position needs
+        // changes hands, not the whole ETH side.
+        const cost = Math.abs(target.eth - parkedEth) * point.price * costFrac;
         const txGas = gasModel.txOverheadUsd + gasModel.perFillUsd;
         swapCostUsd += cost;
         gasUsd += txGas;
         redeployedFees += feeCash;
         feeCash = 0;
         position = openPosition(Math.max(capital - cost - txGas, 0), point.price, cfg.rangePct);
+        parkedEth = 0;
+        parkedUsdc = 0;
         parked = false;
         lastParkChangeAt = point.timestamp;
         lastRecenterAt = point.timestamp;
@@ -550,7 +592,7 @@ export function runPassiveLp(
   const last = data[data.length - 1]!;
   const finalHoldings = holdingsOf(position, last.price);
   const positionValue = parked
-    ? parkedCash
+    ? parkedValue(last.price)
     : finalHoldings.eth * last.price + finalHoldings.usdc;
   // Close the short at the last price, so the result is a realised number.
   if (shortEth !== 0) {
@@ -579,7 +621,7 @@ export function runPassiveLp(
 
   // Fees folded into the position are income, not position performance, so
   // they are removed here and reported under feeIncomeUsd instead. Interest
-  // earned while parked is income too: it accrues into parkedCash and would
+  // earned while parked is income too: it accrues into the parked balance and would
   // otherwise read as the position having appreciated while holding nothing.
   const positionPnlUsd =
     positionValue - initialCapital - redeployedFees - parkedYieldUsd + swapCostUsd + gasUsd;

@@ -182,6 +182,52 @@ level — and it is the failure mode no amount of fee income fixes.
 * The unhedged directional exposure is the dominant risk, not the parameters.
   A regime filter or a short hedge addresses it; tuning range width does not.
 
+## What the parked book actually holds — and why it reverses the filter result
+
+The model held parked capital as a single USD scalar: park sold the base side,
+charged a swap for it, and the book carried no directional exposure until
+re-entry. **The live bot does not do that.** `closePosition` deliberately does
+not consolidate, so the parked book keeps whatever mix the position held:
+
+```
+2026-09-14  0.0581 ETH ($144) + $263 USDC  ->  35% still ETH
+2026-09-16  0.1021 ETH ($249) + $157 USDC  ->  61% still ETH
+```
+
+The model was wrong twice over: it charged a swap never paid, and it credited
+the filter with removing exposure that is in fact retained. Corrected, at the
+live-measured fee rate with regime 3%:
+
+| parked-book policy | mean | worst | profitable |
+| --- | --- | --- | --- |
+| no filter at all | −1.44% | −24.6% | 1/4 |
+| **keep the mix (what ships, no hedge)** | **−2.68%** | **−32.9%** | 2/4 |
+| keep the mix + hedge while parked | +3.45% | −11.4% | 3/4 |
+| keep the mix + hedge continuously | +2.77% | −6.0% | 3/4 |
+| **sell to cash at park** | **+3.70%** | −11.9% | 3/4 |
+
+**As configured today the filter does not help.** It measures worse than no
+filter at all, on both mean and worst fold. Every earlier result showing the
+filter worth ~5 points assumed a park-to-cash it never performed.
+
+The filter only works if the parked exposure is actually removed, by one of two
+routes:
+
+* **`parkToCash`** — sell the base side at park. One swap, no borrowing, no
+  liquidation risk. Best measured mean.
+* **the short hedge** — borrow and sell against it. Nearly as good, and better
+  on the tail when run continuously.
+
+This also overturns the earlier verdict that the hedge is "the wrong tool".
+That argument was: while parked the ETH is loose tokens, so just sell it. True
+— but the bot never sells it, so the exposure persists and hedging it is
+exactly the right tool for the book as built. The hedge was dismissed on the
+strength of a model that did not describe the strategy.
+
+Neither is enabled yet. `parkToCash` is the simpler of the two and needs a
+matching change in `closePosition`; the hedge already exists behind
+`HEDGE_ENABLED`. Decide with a measured fee rate, not on four folds.
+
 ## Hysteresis, and a model/live divergence
 
 Re-entry requires a calmer reading than parking: `LP_REGIME_REENTER_MARGIN_PCT`
