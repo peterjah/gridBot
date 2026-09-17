@@ -73,6 +73,64 @@ the model's internal post-concentration figure.
 The last outcome is not a failure of the exercise. Establishing that a strategy
 does not work, with evidence, is the result.
 
+## What this dataset can and cannot resolve
+
+Measured 2026-09-17. Four folds of ~83 days, shipped configuration:
+
+| folds | mean | std err | 95% CI on the mean |
+| --- | --- | --- | --- |
+| 4 | −2.68% | 11.13 | **[−24.5%, +19.1%]** |
+| 8 | −1.50% | 5.03 | [−11.4%, +8.4%] |
+| 16 | +0.18% | 2.72 | [−5.1%, +5.5%] |
+| 24 | −0.90% | 1.69 | [−4.2%, +2.4%] |
+
+At four folds the standard error on a *difference between two configurations*
+is 12–15 points. Every comparison made in this project is smaller than that:
+
+| comparison | difference | se | verdict |
+| --- | --- | --- | --- |
+| filter 3% vs off | −1.24 | 15.36 | noise |
+| filter 3% vs 4% | −0.63 | 15.36 | noise |
+| dwell 0/24 vs 24/24 | −4.02 | 13.16 | noise |
+| band ±5% vs ±2% | +0.89 | 13.59 | noise |
+| parkToCash off vs on | −6.38 | 12.42 | noise |
+
+**The backtest cannot choose between configurations.** It resolves structural
+facts — "earning the pool fee beats paying it" is a 140-point difference, far
+outside the noise — and nothing finer. Treat every ranked table of
+configurations in this repository as unresolved.
+
+Pairing helps: run both configurations over the *same* windows and the
+difference no longer carries the market's variance. Over 20 windows of ~23
+days, paired against the shipped config:
+
+| alternative | mean diff | se | t | wins |
+| --- | --- | --- | --- | --- |
+| parkToCash | −2.24 | 1.57 | −1.4 | 7/20 |
+| hedge while parked | −2.38 | 1.57 | −1.5 | 6/20 |
+| hedge continuous | −1.49 | 1.98 | −0.8 | 7/20 |
+| filter off entirely | +1.79 | 0.91 | 2.0 | 13/20 |
+
+Still nothing significant — and note `parkToCash` reverses sign against the
+unpaired estimate that made it look attractive. **Use paired windows for any
+future comparison**; the unpaired fold table is ~8× noisier and has repeatedly
+produced signs that do not survive.
+
+## The regime filter does not do what its name says
+
+Structural, and independent of any point estimate: the filter parks by
+withdrawing the position to loose tokens, and the live bot does not consolidate
+them. Observed parked books held **35% and 61% of their value in ETH**.
+
+So parking buys "stop re-centring into the move" and "stop earning fees", but
+not "go flat". The directional exposure the filter exists to avoid is largely
+retained. Removing it needs either `parkToCash` or the short hedge — neither of
+which measurably helps, per the section above, but both of which would at least
+make the mechanism match its description.
+
+Worth knowing before trusting the filter to protect capital in a crash. It
+mostly will not.
+
 ## What is already settled
 
 These held up across every correction and do not need re-testing:
@@ -80,10 +138,11 @@ These held up across every correction and do not need re-testing:
 * **Earning the pool fee beats paying it.** −26.4% vs +113.4% on identical
   data, same strategy, only the cost structure differing. The most robust
   finding here.
-* **The regime filter helps, and its edge shrinks as fees rise.** Off vs best
-  threshold: −7.8% → +5.7% at 52% APR, −1.4% → +7.8% at 63%, +8.9% → +11.0% at
-  78%. Its benefit is roughly constant while its cost — fees forgone while
-  parked — grows with the rate. Above ~80% it is nearly worthless.
+* ~~**The regime filter helps.**~~ **Withdrawn.** Every version of this claim
+  rested on a model that sold the base side at park, which the live bot never
+  does. Corrected, and paired properly, the filter is indistinguishable from
+  having none — and the only near-significant result mildly favours removing
+  it. See the two sections above.
 * **Realized volatility is not a better regime metric than displacement**, and
   a signed (falls-only) variant measured worse than absolute.
 * **The hedge as shipped is the wrong tool** while parked, where the ETH can
