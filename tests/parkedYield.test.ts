@@ -21,6 +21,7 @@ const base: Omit<PassiveLpConfig, "parkedYieldAprPct"> = {
   hedgeWhileParkedOnly: false,
   parkDwellHours: 0,
   unparkDwellHours: 24,
+  regimeReenterMarginPct: 25,
 };
 
 /** Calm, then a sustained ramp that keeps the filter parked. */
@@ -35,7 +36,8 @@ function series(points: number, aprPct = 50): PricePoint[] {
 
 describe("parked yield", () => {
   it("is inert at zero, reproducing the previous behaviour", () => {
-    const r = runPassiveLp({ ...base, parkedYieldAprPct: 0 }, series(600), 0.02);
+    const r = runPassiveLp({ ...base, regimeReenterMarginPct: 25,
+ parkedYieldAprPct: 0 }, series(600), 0.02);
     expect(r.parkedYieldUsd).toBe(0);
   });
 

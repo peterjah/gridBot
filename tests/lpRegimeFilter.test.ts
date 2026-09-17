@@ -17,6 +17,7 @@ const base: Omit<PassiveLpConfig, "regimeMaxMovePct"> = {
   hedgeBorrowAprPct: 3,
   hedgeWhileParkedOnly: false,
   regimeMetric: "displacement" as const,
+  regimeReenterMarginPct: 25,
   parkedYieldAprPct: 0,
   parkDwellHours: 24,
   unparkDwellHours: 24,
@@ -119,5 +120,61 @@ describe("LP regime filter", () => {
     const r = runPassiveLp({ ...base, regimeMaxMovePct: 5 }, data, 0.02);
     // At most one state change per 24h over 600 hours.
     expect(r.parkEvents).toBeLessThanOrEqual(Math.ceil(600 / 24));
+  });
+});
+
+/**
+ * The live bot has always required a calmer reading to re-enter than to park.
+ * The model did not until 2026-09-17, so every regime result before then
+ * simulated a less sticky strategy than the one actually running.
+ */
+describe("regime hysteresis", () => {
+  /** Oscillates either side of a 3% threshold, the shape that churns. */
+  function wobble(points: number): PricePoint[] {
+    const start = 1_800_000_000;
+    return Array.from({ length: points }, (_, i) => ({
+      timestamp: start + i * 3600,
+      // Calm prefix so the lookback fills, then a move hovering at ~3%.
+      price: 3000 * (i < 30 ? 1 : 1 + 0.03 + 0.012 * Math.sin(i / 5)),
+      feeAprPct: 50,
+    }));
+  }
+
+  it("never causes more flips as the margin widens", () => {
+    // Dwell zeroed: it gates transitions too, and would otherwise be the
+    // binding constraint rather than the margin under test.
+    const free = { ...base, regimeMaxMovePct: 3, parkDwellHours: 0, unparkDwellHours: 0 };
+    const events = [0, 10, 25, 50, 75].map(
+      (m) => runPassiveLp({ ...free, regimeReenterMarginPct: m }, wobble(600), 0.02).parkEvents,
+    );
+    for (let i = 1; i < events.length; i++) {
+      expect(events[i]!).toBeLessThanOrEqual(events[i - 1]!);
+    }
+  });
+
+  /** More hysteresis means a calmer reading is required to re-enter. */
+  it("keeps the bot parked longer for a wider margin", () => {
+    const free = { ...base, regimeMaxMovePct: 3, parkDwellHours: 0, unparkDwellHours: 0 };
+    const narrow = runPassiveLp({ ...free, regimeReenterMarginPct: 10 }, wobble(600), 0.02);
+    const wide = runPassiveLp({ ...free, regimeReenterMarginPct: 75 }, wobble(600), 0.02);
+    expect(wide.timeParkedPct).toBeGreaterThanOrEqual(narrow.timeParkedPct);
+  });
+
+  it("is inert when the filter is off", () => {
+    const a = runPassiveLp({ ...base, regimeMaxMovePct: 0, regimeReenterMarginPct: 0 }, wobble(400), 0.02);
+    const b = runPassiveLp({ ...base, regimeMaxMovePct: 0, regimeReenterMarginPct: 75 }, wobble(400), 0.02);
+    expect(a.returnPct).toBeCloseTo(b.returnPct, 9);
+    expect(a.parkEvents).toBe(0);
+  });
+
+  it("keeps the accounting identity across margins", () => {
+    for (const regimeReenterMarginPct of [0, 25, 50, 75]) {
+      const r = runPassiveLp(
+        { ...base, regimeMaxMovePct: 3, regimeReenterMarginPct },
+        wobble(600),
+        0.02,
+      );
+      expect(() => assertLpReconciles(r)).not.toThrow();
+    }
   });
 });

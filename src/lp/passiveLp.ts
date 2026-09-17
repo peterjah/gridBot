@@ -86,6 +86,16 @@ export interface PassiveLpConfig {
   parkDwellHours: number;
   unparkDwellHours: number;
   /**
+   * Re-entry requires the move to fall this far BELOW the exit threshold, as a
+   * percent of it. 25 means exit above 3% and re-enter below 2.25%.
+   *
+   * The live bot has always had this; the model did not, so every regime
+   * result before 2026-09-17 simulated a single-threshold filter that
+   * re-entered the instant the move dipped under the exit level. That is a
+   * different — and less sticky — strategy than the one actually running.
+   */
+  regimeReenterMarginPct: number;
+  /**
    * Supply APR earned on capital while parked, percent.
    *
    * The live bot lends idle capital to Aave whenever the regime filter stands
@@ -321,7 +331,7 @@ export function runPassiveLp(
    * `i - lookback`, never forward. Before the window has filled it returns
    * false: no history is not evidence of a big move.
    */
-  const regimeHostile = (i: number): boolean => {
+  const regimeHostileAt = (i: number, threshold: number): boolean => {
     if (!(cfg.regimeMaxMovePct > 0)) return false;
     const lookback = Math.max(Math.trunc(cfg.regimeLookbackPoints), 1);
     if (i < lookback) return false;
@@ -333,7 +343,7 @@ export function runPassiveLp(
       case "signed": {
         // Only a FALL is hostile. A rally moves the position out of range too,
         // but into the side that is followed by the best outcomes in-sample.
-        return (nowPrice / firstPrice - 1) * 100 < -cfg.regimeMaxMovePct;
+        return (nowPrice / firstPrice - 1) * 100 < -threshold;
       }
       case "drawdown": {
         let peak = 0;
@@ -343,7 +353,7 @@ export function runPassiveLp(
           if (p > peak) peak = p;
           if (peak > 0) worst = Math.min(worst, (p - peak) / peak);
         }
-        return Math.abs(worst) * 100 > cfg.regimeMaxMovePct;
+        return Math.abs(worst) * 100 > threshold;
       }
       case "volatility": {
         // Standard deviation of log returns across the window, scaled to the
@@ -364,10 +374,10 @@ export function runPassiveLp(
           const prev = data[j - 1]!.price;
           if (prev > 0) variance += (Math.log(data[j]!.price / prev) - mean) ** 2;
         }
-        return Math.sqrt(variance / count) * Math.sqrt(count) * 100 > cfg.regimeMaxMovePct;
+        return Math.sqrt(variance / count) * Math.sqrt(count) * 100 > threshold;
       }
       default:
-        return Math.abs((nowPrice / firstPrice - 1) * 100) > cfg.regimeMaxMovePct;
+        return Math.abs((nowPrice / firstPrice - 1) * 100) > threshold;
     }
   };
 
@@ -442,7 +452,12 @@ export function runPassiveLp(
     // side and re-entering buys it back, both at full cost, and no fees accrue
     // in between. The same dwell time as re-centring keeps it from churning.
     if (cfg.regimeMaxMovePct > 0) {
-      const hostile = regimeHostile(i);
+      const hostile = regimeHostileAt(i, cfg.regimeMaxMovePct);
+      // Hysteresis: leaving park needs a calmer reading than entering it, or
+      // a move hovering at the threshold flips the position on every wobble.
+      const reenterMaxPct =
+        cfg.regimeMaxMovePct * (1 - cfg.regimeReenterMarginPct / 100);
+      const calmEnough = !regimeHostileAt(i, reenterMaxPct);
       const sinceChange = point.timestamp - lastParkChangeAt;
       const mayPark = sinceChange >= cfg.parkDwellHours * 3600;
       const mayUnpark = sinceChange >= cfg.unparkDwellHours * 3600;
@@ -458,7 +473,7 @@ export function runPassiveLp(
         parkEvents++;
         lastParkChangeAt = point.timestamp;
         resizeHedge(point.price);
-      } else if (!hostile && parked && mayUnpark) {
+      } else if (calmEnough && parked && mayUnpark) {
         // Re-enter with everything, including fees collected before parking.
         const capital = parkedCash + feeCash;
         const fresh = openPosition(Math.max(capital, 0), point.price, cfg.rangePct);

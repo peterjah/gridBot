@@ -182,6 +182,43 @@ level — and it is the failure mode no amount of fee income fixes.
 * The unhedged directional exposure is the dominant risk, not the parameters.
   A regime filter or a short hedge addresses it; tuning range width does not.
 
+## Hysteresis, and a model/live divergence
+
+Re-entry requires a calmer reading than parking: `LP_REGIME_REENTER_MARGIN_PCT`
+(25) means exit above 3% and re-enter below 2.25%. Without it a move hovering
+at the threshold flips the position on every wobble.
+
+**The live bot has always had this. The model did not until 2026-09-17.** Every
+regime result before that date simulated a single-threshold filter that
+re-entered the instant the move dipped under the exit level — a less sticky
+strategy than the one running. The gap is small but the rankings below were
+re-derived after closing it.
+
+Swept at the live-measured fee rate, parked yield credited:
+
+| margin | re-enter below | mean | worst | park events |
+| --- | --- | --- | --- | --- |
+| 0% | 3.00% | +5.53% | −4.8% | 104 |
+| 15% | 2.55% | +4.89% | −7.7% | 95 |
+| 25% *(current)* | 2.25% | +3.70% | −11.9% | 89 |
+| 40% | 1.80% | +4.85% | −12.1% | 84 |
+| 75% | 0.75% | +3.04% | −14.1% | 67 |
+
+The surface is not monotonic — 25% is worse than both its neighbours — which
+is not a shape a real effect produces. Four folds cannot resolve differences
+this size, so the margin stays at 25% despite measuring worst: moving to 0%
+would remove hysteresis entirely on noise.
+
+Note also what does **not** change: parked time stays at 74–76% across every
+margin. The margin controls how often the filter flips, not how long it sits
+out.
+
+What the model still cannot see: a live whipsaw on 2026-09-16 deployed for
+1h45m and paid a full swap round trip (~$0.40) for ~$0.03 of fees. The model
+charges the entry swap differently, so a 105-minute deployment looks nearly
+free in it. If that recurs, a **minimum deployment time** targets it directly —
+hysteresis does not.
+
 ## The dwell timer, split by direction
 
 The filter's dwell prevents thrashing, and it is genuinely needed: removing it
