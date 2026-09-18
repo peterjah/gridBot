@@ -9,18 +9,32 @@ Out-of-sample walk-forward return depends almost entirely on the fee rate the
 pool actually pays, and nothing else moves the answer as much. Scaling the
 input APR series, ±5% band with the regime filter at 3%:
 
-| input fee APR | mean fold (0.23y) | annualised | vs ETH hold |
+| input fee APR | mean per 23d window | std err | windows positive |
 | --- | --- | --- | --- |
-| 52% *(series as fetched)* | +3.26% | +19.9% | +12.8% |
-| 42% | +1.73% | +11.6% | +11.3% |
-| 34% | +0.60% | +5.9% | +10.2% |
-| 31% | +0.22% | +4.0% | +9.8% |
-| 26% | −0.53% | +0.4% | +9.0% |
-| 23% | −0.90% | −1.3% | +8.7% |
+| 73% | +3.83% | 2.39 | 12/20 |
+| 62% | +2.71% | 2.31 | 12/20 |
+| 52% *(series as fetched)* | +1.60% | 2.25 | 12/20 |
+| 42% | +0.49% | 2.20 | 12/20 |
+| **36%** | **−0.06%** | 2.18 | 11/20 |
+| 31% | −0.60% | 2.16 | 10/20 |
+| 26% | −1.15% | 2.14 | 10/20 |
 
-**Break-even is around 28–30% fee APR** — the point where a fold ends with the
-same dollars it started. The more honest bar is slightly higher: idle capital
-earns ~4% in Aave with no divergence loss and no gas, and that is met at ~31%.
+Annualised figures are deliberately omitted: compounding a 23-day return to a
+year and then averaging produces numbers like 340%, which is an artifact of the
+window length rather than a result.
+
+**Break-even is around 36% fee APR** — the point where a window ends with the
+same dollars it started, measured over 20 paired windows with the park keeping
+its real token mix.
+
+An earlier figure of 28–30% here came from a model that sold the base side at
+park. That cash parking avoided drawdowns the bot actually sits through, so it
+broke even at a lower rate than the real strategy does.
+
+The margin over break-even is not statistically established. At 52% input APR
+the mean is +1.60% per window with a standard error of 2.25 — t ≈ 0.7, and 12
+of 20 windows positive. "Probably above break-even" is the honest reading, not
+"demonstrably".
 
 Measured live so far: **63.2%**, over only 2.13 deployed-days at 100% in range
 (2026-09-15). That is above break-even, but the sample is far too small and has
@@ -61,14 +75,13 @@ the model's internal post-concentration figure.
 
 ## How to read the answer
 
-* **Measured ≳ 50%** — comfortably above break-even. At the series rate the
-  folds give ~+20% annualised and ~+13% over holding ETH. Viable, and worth
-  re-running the band and threshold sweeps calibrated before scaling up.
-* **Measured ≈ 30%** — at break-even. The strategy returns roughly nothing
-  after divergence loss and costs, and the capital would do as well in Aave
-  for none of the risk.
-* **Measured ≲ 25%** — below break-even. The strategy does not work at this
-  size on this pool.
+* **Measured ≳ 60%** — clearly above break-even, and far enough that the margin
+  survives the noise. Viable.
+* **Measured ≈ 40–55%** — above break-even but inside the error bars. This is
+  where the first live readings land (53.5% at 2.64 deployed-days). It means
+  "not obviously losing", not "working".
+* **Measured ≲ 36%** — at or below break-even. The capital would do as well in
+  Aave for none of the risk.
 
 The last outcome is not a failure of the exercise. Establishing that a strategy
 does not work, with evidence, is the result.
